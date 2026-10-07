@@ -7,12 +7,15 @@
     target: "★ Butterfly Knife | Doppler",
     minWear: "any",
     st: false,
-    cur: "USD",
+    cur: "EUR",
     phaseMode: "merged",
     floatMode: "normalized",
     fee: 2,
-    off: [],               // sources desactivees par l'utilisateur
+    // sources desactivees : l'ancien releve Steam est exclu par defaut pour
+    // que seuls des prix actuels entrent dans les calculs
+    off: ["fb"],
   };
+  const KEY_PRICE = 2.49;  // cle de caisse Steam, dans la devise de base des prix
   let catalog, prices;
 
   const SHORT = { "Factory New": "FN", "Minimal Wear": "MW", "Field-Tested": "FT",
@@ -24,9 +27,14 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-  function money(usd, digits) {
-    if (usd == null || !isFinite(usd)) return "—";
-    const v = state.cur === "EUR" ? usd * ((prices.fx && prices.fx.EUR) || 0.86) : usd;
+  const base = () => prices.currency || "USD";
+  const usdEur = () => (prices.fx && (prices.fx.USD_EUR || prices.fx.EUR)) || 0.86;
+
+  /** Montant dans la devise de base des prix, affiche dans la devise choisie. */
+  function money(amount, digits) {
+    if (amount == null || !isFinite(amount)) return "—";
+    let v = amount;
+    if (state.cur !== base()) v = state.cur === "EUR" ? amount * usdEur() : amount / usdEur();
     const d = digits != null ? digits : (Math.abs(v) >= 1000 ? 0 : 2);
     return v.toLocaleString("fr-FR", { style: "currency", currency: state.cur, currencyDisplay: "narrowSymbol",
                                         minimumFractionDigits: d, maximumFractionDigits: d });
@@ -97,10 +105,29 @@
     $("#stale").hidden = live;
     if (!live) {
       const fb = prices.sources.fb;
-      $("#stale").innerHTML = `<b>Attention : aucun prix en direct pour l'instant.</b> Les montants viennent
-        ${fb && fb.updated_at ? `du dernier relevé Steam disponible (${esc(new Date(fb.updated_at).toLocaleDateString("fr-FR"))})` : "de relevés anciens"}
-        et peuvent être très loin du marché actuel. Le relevé automatique tourne toutes les 30 minutes.`;
+      $("#stale").innerHTML = `<b>Attention : aucun prix en direct pour l'instant.</b> Aucun marché n'a répondu
+        ces 6 dernières heures. Pour ne pas calculer avec des prix périmés, l'ancien relevé Steam
+        ${fb && fb.updated_at ? `(${esc(new Date(fb.updated_at).toLocaleDateString("fr-FR"))})` : ""} est exclu ;
+        tu peux le réactiver dans les options avancées. Le relevé automatique tourne toutes les 30 minutes.`;
     }
+
+    // devise : d'ou viennent les euros affiches
+    const fx = prices.fx || {};
+    const conv = prices.order.filter((k) => prices.sources[k] && prices.sources[k].native === "USD" && k !== "fb")
+      .map(srcName);
+    $("#fx").innerHTML = base() === "EUR"
+      ? `Prix en euros. Skinport cote en € ; ${esc(conv.join(", "))} cotent en $, convertis au taux BCE
+         ${fx.date ? `du ${esc(new Date(fx.date).toLocaleDateString("fr-FR"))}` : ""} : 1 $ = ${usdEur().toLocaleString("fr-FR", { maximumFractionDigits: 4 })} €${fx.stale ? " (taux ancien)" : ""}.`
+      : `Prix en dollars, convertis en euros au taux de 1 $ = ${usdEur()} € quand tu choisis EUR.`;
+  }
+
+  /** Prix d'origine sur le site, quand il cote dans une autre devise que la base. */
+  function nativeTip(src, price) {
+    const s = prices.sources[src];
+    if (!s || !s.native || s.native === base()) return "";
+    const orig = base() === "EUR" ? price / usdEur() : price * usdEur();
+    const txt = orig.toLocaleString("fr-FR", { style: "currency", currency: s.native, currencyDisplay: "narrowSymbol" });
+    return ` title="${esc(txt)} sur ${esc(s.label)} (converti au taux BCE)"`;
   }
 
   // ----------------------------------------------------------- controles
@@ -136,13 +163,13 @@
     if (h.get("t") && catalog.golds[h.get("t")]) state.target = h.get("t");
     if (h.get("w")) state.minWear = h.get("w");
     state.st = h.get("st") === "1";
-    if (h.get("cur") === "EUR") state.cur = "EUR";
+    if (h.get("cur") === "USD") state.cur = "USD";
   }
 
   function writeHash() {
     const h = new URLSearchParams({ t: state.target, w: state.minWear });
     if (state.st) h.set("st", "1");
-    if (state.cur !== "USD") h.set("cur", state.cur);
+    if (state.cur !== "EUR") h.set("cur", state.cur);
     history.replaceState(null, "", "#" + h.toString());
   }
 
@@ -158,6 +185,7 @@
     const engine = TradeupEngine.create(catalog, prices, {
       fee: state.fee, phaseMode: state.phaseMode, floatMode: state.floatMode,
       sources: prices.order.filter((k) => !state.off.includes(k)),
+      keyPrice: KEY_PRICE,
     });
     const t0 = performance.now();
     const res = engine.analyze(state.target, { st: state.st, minWear: state.minWear });
@@ -175,13 +203,20 @@
         <p>${res.cases.length ? `Obtenable par trade-up depuis : <b>${esc(res.cases.join(", "))}</b>` : "Aucune caisse ne permet de l'obtenir par trade-up dans ce mode."}</p>
         ${phases}</div></div>`;
 
-    if (!res.methods.length) {
-      return head + `<div class="card empty">Aucun prix disponible pour ce gold ni pour ses inputs.</div>`;
+    // l'ouverture de caisses n'est pas un trade-up : hors classement, en simple comparaison
+    const ranked = res.methods.filter((m) => m.kind !== "unbox");
+    const unboxes = res.methods.filter((m) => m.kind === "unbox");
+    if (!ranked.length) {
+      // meme sans methode chiffrable, on explique pourquoi (float impossible, pas d'annonce)
+      const why = res.notes.map((n) => floatNote(n, res, engine)).join("");
+      return head + `<div class="card"><p class="verdict">Aucune méthode chiffrable avec les prix actuels des sites cochés :
+        pas d'annonce pour l'acheter directement${why ? ", et le trade-up ne peut pas garantir cette usure" : " ni pour les inputs d'un trade-up"}.</p>${why}</div>`
+        + (unboxes.length ? renderUnbox(unboxes) : "");
     }
 
-    const best = res.methods[0];
-    const buy = res.methods.find((m) => m.kind === "buy");
-    const tu = res.methods.find((m) => m.kind === "tradeup");
+    const best = ranked[0];
+    const buy = ranked.find((m) => m.kind === "buy");
+    const tu = ranked.find((m) => m.kind === "tradeup");
     let verdict = `<b>Le moins cher en moyenne : ${esc(best.label)}</b> — ${money(best.expected)}`;
     if (best.kind === "buy" && tu) {
       verdict += `. Le meilleur trade-up revient à ${money(tu.expected)} en moyenne pour avoir cette cible, soit ${(tu.expected / best.expected).toLocaleString("fr-FR", { maximumFractionDigits: 1 })}× plus cher.`;
@@ -193,7 +228,7 @@
     }
     const notes = res.notes.map((n) => floatNote(n, res, engine)).join("");
 
-    const rows = res.methods.map((m, i) => `<tr class="${i === 0 ? "best" : ""}">
+    const rows = ranked.map((m, i) => `<tr class="${i === 0 ? "best" : ""}">
         <td>${i + 1}</td><td>${esc(m.label)}</td>
         <td class="num"><b>${money(m.expected)}</b></td>
         <td class="num">${m.kind === "buy" ? "—" : money(m.cost)}</td>
@@ -205,12 +240,12 @@
         <thead><tr><th>#</th><th>Méthode</th><th class="num" title="Ce que coûte en moyenne l'obtention de la cible, revente des autres résultats déduite">Coût moyen pour l'avoir</th>
         <th class="num">Coût par tentative</th><th class="num">Chance par tentative</th><th class="num">Tentatives en moyenne</th></tr></thead>
         <tbody>${rows}</tbody></table></div>
-      <p class="muted small">« Coût moyen pour l'avoir » = ce que tu dépenses en moyenne avant de tenir la cible, en revendant au passage tout ce qui n'est pas la cible (frais de revente ${esc(state.fee)} % déduits). Pour l'achat direct, c'est simplement le prix.</p></div>`;
+      <p class="muted small">« Coût moyen pour l'avoir » = ce que tu dépenses en moyenne avant de tenir la cible, en revendant au passage tout ce qui n'est pas la cible (frais de revente ${esc(state.fee)} % déduits). Pour l'achat direct, c'est simplement le prix.</p>
+      ${unboxes.length ? `<p class="muted small">Pour comparaison, sans trade-up : l'ouvrir dans une caisse coûterait ${money(unboxes[0].expected, 0)} en moyenne (${esc(unboxes[0].case)}, détail en bas de page).</p>` : ""}</div>`;
 
     const details = [];
     if (buy) details.push(renderBuy(buy, engine, best === buy));
-    res.methods.filter((m) => m.kind === "tradeup").forEach((m, i) => details.push(renderTradeup(m, i === 0)));
-    const unboxes = res.methods.filter((m) => m.kind === "unbox");
+    ranked.filter((m) => m.kind === "tradeup").forEach((m, i) => details.push(renderTradeup(m, i === 0)));
     if (unboxes.length) details.push(renderUnbox(unboxes));
 
     return head + table + details.join("");
@@ -240,21 +275,22 @@
         const q = r.all.find((x) => x.src === k);
         if (!q) return `<td class="num muted">—</td>`;
         const isBest = r.q && r.q.src === k && m.best === r;
-        return `<td class="num${q.enabled ? "" : " off"}"><a href="${link(k, r.hash)}" target="_blank" rel="noopener">${isBest ? "<b>" : ""}${money(q.price)}${isBest ? "</b>" : ""}</a>${q.qty != null ? `<small> ${num(q.qty)}×</small>` : ""}</td>`;
+        return `<td class="num${q.enabled ? "" : " off"}"><a href="${link(k, r.hash)}" target="_blank" rel="noopener"${nativeTip(k, q.price)}>${isBest ? "<b>" : ""}${money(q.price)}${isBest ? "</b>" : ""}</a>${q.qty != null ? `<small> ${num(q.qty)}×</small>` : ""}</td>`;
       }).join("");
       return `<tr${m.best === r ? ' class="best"' : ""}><td>${esc(r.wear || "—")}</td>${cells}</tr>`;
     }).join("");
     return `<details class="card method"${open ? " open" : ""}><summary><span>Acheter directement</span><b>${money(m.expected)}</b></summary>
       <p>Le moins cher : <b>${esc(m.best.hash)}</b> à ${money(m.best.q.price)} sur ${srcBadge(m.best.q, m.best.hash)}. Aucun risque, tu as la cible tout de suite.</p>
       <div class="scroll"><table><thead><tr><th>Usure</th>${head}</tr></thead><tbody>${rows}</tbody></table></div>
-      <p class="muted small">Prix = annonce la moins chère sur chaque site ; le nombre indique les annonces disponibles.</p></details>`;
+      <p class="muted small">Prix = annonce la moins chère sur chaque site ; le nombre indique les annonces disponibles.
+      Les prix grisés viennent d'une source décochée. Survole un prix CSFloat ou DMarket pour voir son montant d'origine en dollars.</p></details>`;
   }
 
   function renderTradeup(m, open) {
     const inputs = m.inputs.map((k) => `<tr>
         <td class="num"><b>${k.n}×</b></td><td>${esc(k.hash)}<br><small class="muted">${esc(k.case)}</small></td>
         <td class="num">&lt; ${k.float.toFixed(2)}</td>
-        <td class="num">${money(k.price)}</td><td>${srcBadge(k.q, k.hash)}</td>
+        <td class="num"${nativeTip(k.q.src, k.price)}>${money(k.price)}</td><td>${srcBadge(k.q, k.hash)}</td>
         <td class="num">${money(k.price * k.n)}</td></tr>`).join("");
 
     const out = m.outcomes.map((o) => `<tr class="${o.isTarget ? "target" : ""}">
@@ -296,13 +332,13 @@
 
   function renderUnbox(list) {
     const rows = list.map((u) => `<tr><td>${esc(u.case)}</td>
-      <td class="num">${money(u.caseQuote.price)} + ${money(TradeupEngine.KEY_USD)}</td>
+      <td class="num">${money(u.caseQuote.price)} + ${money(KEY_PRICE)}</td>
       <td class="num">${pct(u.p)}</td><td class="num">${num(u.tries)}</td>
       <td class="num"><b>${money(u.expected, 0)}</b></td></tr>`).join("");
-    return `<details class="card method"><summary><span>Ouvrir des caisses</span><b>${money(list[0].expected, 0)}</b></summary>
+    return `<details class="card method"><summary><span>Pour comparaison : ouvrir des caisses (pas un trade-up)</span><b>${money(list[0].expected, 0)}</b></summary>
       <div class="scroll"><table><thead><tr><th>Caisse</th><th class="num">Caisse + clé</th><th class="num">Chance par ouverture</th><th class="num">Ouvertures en moyenne</th><th class="num">Coût moyen brut</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-      <p class="muted small">Chance = 0,26 % d'objet rare (taux publié par Valve) × part de la cible dans le pool de la caisse${state.minWear !== "any" ? " × part de la plage de float compatible avec l'usure demandée" : ""}. Brut : la revente des autres drops n'est pas déduite.</p></details>`;
+      <p class="muted small">La 3ᵉ façon d'obtenir un gold, à côté de l'achat et du trade-up. Chance = 0,26 % d'objet rare (taux publié par Valve) × part de la cible dans le pool de la caisse${state.minWear !== "any" ? " × part de la plage de float compatible avec l'usure demandée" : ""}. Clé comptée ${money(KEY_PRICE)}. Brut : la revente des autres drops n'est pas déduite.</p></details>`;
   }
 
   // -------------------------------------------------------------- events

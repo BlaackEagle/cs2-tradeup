@@ -7,9 +7,13 @@ const dir = path.join(__dirname, "..", "site", "data");
 const cat = JSON.parse(fs.readFileSync(path.join(dir, "catalog.json")));
 const pr = JSON.parse(fs.readFileSync(path.join(dir, "prices.json")));
 let bad = 0;
-for (const [name, st, minWear, lim] of [
+const CASES = [
   ["★ Karambit | Fade", false, "any", null], ["★ Bayonet | Case Hardened", false, "any", null],
-  ["★ M9 Bayonet", true, "any", null], ["★ Karambit | Fade", false, "Factory New", 0.07]]) {
+  ["★ M9 Bayonet", true, "any", null], ["★ Karambit | Fade", false, "Factory New", 0.07]];
+// node tests/big_check.js 4  -> seulement le 4e cas (chaque cas prend ~10 min)
+const only = process.argv.slice(2).map(Number);
+for (const [i, [name, st, minWear, lim]] of CASES.entries()) {
+  if (only.length && !only.includes(i + 1)) continue;
   const t0 = Date.now();
   const tu = E.create(cat, pr, { fee: 2 }).analyze(name, { st, minWear }).methods.find((x) => x.optimal);
   const t1 = Date.now();

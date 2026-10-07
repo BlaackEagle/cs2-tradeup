@@ -15,6 +15,7 @@
       <p class="sub">La façon la moins chère d'obtenir un couteau ou des gants précis : achat direct, trade-up 5 Coverts ou ouverture de caisses.</p>
       <div id="sources" class="sources" aria-label="Fraîcheur des prix par source"></div>
       <p id="updated" class="muted small"></p>
+      <p id="fx" class="muted small"></p>
     </div>
   </header>
 
@@ -32,7 +33,7 @@
         <label>Usure minimale <select id="wear"></select></label>
         <label class="check"><input type="checkbox" id="st"> StatTrak™</label>
         <label>Devise
-          <select id="cur"><option value="USD">USD $</option><option value="EUR">EUR €</option></select>
+          <select id="cur"><option value="EUR">EUR €</option><option value="USD">USD $</option></select>
         </label>
       </div>
       <details class="adv">
@@ -68,7 +69,9 @@
         <li><b>Dans le pool</b>, chaque finition est supposée avoir la même chance. Valve ne publie pas ces taux : c'est l'hypothèse des calculateurs communautaires. Pour les Doppler, les sources ne s'accordent pas sur le poids des phases : l'option avancée « chaque phase = une chance » montre l'autre lecture, et change beaucoup le résultat pour un Doppler.</li>
         <li><b>Float de sortie</b> = min + moyenne des positions des inputs × (max − min) du gold obtenu. L'optimiseur prend le pire float possible de chaque palier d'usure acheté, donc l'usure annoncée est garantie.</li>
         <li><b>Coût moyen pour avoir la cible</b> = (prix du contrat − revente moyenne des autres golds) ÷ chance de la cible. C'est une moyenne : un contrat peut te donner la cible du premier coup, ou pas avant des dizaines d'essais.</li>
-        <li><b>Prix</b> = annonce la moins chère parmi les sites cochés. Les inputs sont achetés au prix le plus bas, la revente se fait au prix le plus bas moins tes frais. Seule la phase la moins chère d'un Doppler est cotée.</li>
+        <li><b>Prix</b> = annonce la moins chère parmi les sites cochés, relevée toutes les 30 minutes. Les inputs sont achetés au prix le plus bas, la revente se fait au prix le plus bas moins tes frais. Seule la phase la moins chère d'un Doppler est cotée.</li>
+        <li><b>Euros</b> : Skinport cote en € ; CSFloat, DMarket et Steam cotent en $, convertis au taux de référence BCE du jour (affiché en haut). Sur ces sites, le prix affiché en $ peut donc différer légèrement de l'équivalent en € de ta banque. Un prix de plus de 12 h n'est jamais repris : sans prix actuel, l'item est marqué « pas en vente ».</li>
+        <li><b>Ouvrir des caisses</b> n'est pas un trade-up : c'est la troisième façon d'obtenir un gold, montrée seulement pour comparaison.</li>
         <li>Les golds reçus sont bloqués 7 jours. Les prix bougent vite depuis cette mise à jour : vérifie chaque prix sur le site avant d'acheter.</li>
       </ul>
     </section>

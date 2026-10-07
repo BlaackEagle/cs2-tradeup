@@ -36,6 +36,7 @@
     const fee = (opts.fee == null ? 2 : opts.fee) / 100;
     const phaseMode = opts.phaseMode || "merged";        // "merged" | "entries"
     const floatMode = opts.floatMode || "normalized";    // "normalized" | "raw"
+    const keyPrice = opts.keyPrice == null ? KEY_USD : opts.keyPrice;  // devise des prix
 
     function wearOf(f) {
       for (const [n, , hi] of wears) if (f < hi) return n;
@@ -357,7 +358,7 @@
       }
       const p = P_GOLD * t.w * frac * (st ? 0.1 : 1);
       if (!p) return null;
-      const cost = cq.price + KEY_USD;
+      const cost = cq.price + keyPrice;
       return { kind: "unbox", case: col.case, caseQuote: cq, cost, p, expected: cost / p, tries: 1 / p };
     }
 

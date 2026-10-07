@@ -2,20 +2,26 @@
 """
 Recupere les prix actuels de tous les Coverts de caisse, de tous les golds
 (couteaux / gants) et des caisses, sur plusieurs marches, et ecrit
-site/data/prices.json.
+site/data/prices.json, EN EUROS.
 
-Chaque source est independante : si l'une tombe (rate limit, API changee,
-cle manquante), les autres continuent, et les derniers prix connus de la
-source en panne sont repris depuis le fichier precedent avec leur date
-d'origine. Le site affiche l'age de chaque source.
+Devise : Skinport cote nativement en euros. CSFloat et DMarket cotent en
+dollars (Steam aussi depuis les serveurs GitHub, situes aux Etats-Unis) : ces
+prix sont convertis au taux de reference BCE du jour, ecrit dans le fichier
+et affiche sur le site.
+
+Fraicheur : chaque source est independante. Si l'une tombe (rate limit, API
+changee, cle manquante), les autres continuent ; les derniers prix connus de
+la source en panne sont repris s'ils ont moins de 12 h, avec leur date
+d'origine. Au-dela ils sont abandonnes : mieux vaut "pas de prix" qu'un prix
+perime.
 
 Sources
-  skinport      API publique, tous les items en un appel
-  csfloat       liste de prix (CSFLOAT_API_KEY optionnelle)
-  dmarket       prix agreges par lots de 100 titres
-  steam         recherche du Steam Market par categorie (lent, rate limite)
-  steam_weekly  releve Steam publie sur GitHub par ByMykel (filet de securite ;
-                sa date est affichee, il peut avoir plusieurs semaines)
+  skinport      API publique, tous les items en un appel                (EUR)
+  csfloat       liste de prix, CSFLOAT_API_KEY optionnelle             (USD)
+  dmarket       meilleures offres, par lots de 100 titres              (USD)
+  steam         recherche du Steam Market par categorie, rate limitee  (USD)
+  steam_weekly  ancien releve Steam publie sur GitHub par ByMykel      (USD)
+                -> exclu des calculs par defaut sur le site
 
     python scripts/fetch_prices.py
     python scripts/fetch_prices.py --previous https://.../data/prices.json
@@ -25,7 +31,6 @@ Sources
 import argparse
 import json
 import os
-import re
 import statistics
 import sys
 import time
@@ -45,14 +50,33 @@ LABELS = {
     "csfloat": "CSFloat",
     "dmarket": "DMarket",
     "steam": "Steam Market",
-    "steam_weekly": "Steam (relevé GitHub)",
+    "steam_weekly": "Steam (ancien relevé)",
 }
 KEYS = {"skinport": "sk", "csfloat": "cf", "dmarket": "dm",
         "steam": "st", "steam_weekly": "fb"}
+NATIVE = {"skinport": "EUR", "csfloat": "USD", "dmarket": "USD",
+          "steam": "USD", "steam_weekly": "USD"}
+LIVE = {"skinport", "csfloat", "dmarket", "steam"}
+MAX_CARRY_H = 12            # age max des prix repris d'un releve precedent
+
+# items affiches dans les logs pour controle a l'oeil
+SAMPLES = ["★ Butterfly Knife | Doppler (Factory New)", "★ Karambit | Doppler (Factory New)",
+           "AK-47 | The Empress (Field-Tested)", "AK-47 | Bloodsport (Field-Tested)",
+           "★ Sport Gloves | Vice (Field-Tested)"]
 
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def age_h(iso):
+    if not iso:
+        return float("inf")
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return float("inf")
+    return (datetime.now(timezone.utc) - t).total_seconds() / 3600
 
 
 def log(*a):
@@ -108,9 +132,10 @@ def http(method, url, retries=4, **kw):
             continue
         if r.status_code == 429 or r.status_code >= 500:
             last = f"HTTP {r.status_code}"
-            wait = int(r.headers.get("Retry-After", 0) or 0) or 20 * (attempt + 1)
-            log(f"    {last}, nouvel essai dans {wait}s")
-            time.sleep(min(wait, 120))
+            if attempt + 1 < retries:
+                wait = int(r.headers.get("Retry-After", 0) or 0) or 20 * (attempt + 1)
+                log(f"    {last}, nouvel essai dans {wait}s")
+                time.sleep(min(wait, 120))
             continue
         return r
     raise SourceError(last or "echec reseau")
@@ -118,7 +143,7 @@ def http(method, url, retries=4, **kw):
 
 def fetch_skinport(names):
     r = http("GET", "https://api.skinport.com/v1/items",
-             params={"app_id": 730, "currency": "USD", "tradable": 0},
+             params={"app_id": 730, "currency": "EUR", "tradable": 0},
              headers={"Accept-Encoding": "br"})
     if r.status_code != 200:
         raise SourceError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -127,6 +152,8 @@ def fetch_skinport(names):
         n = it.get("market_hash_name")
         p = it.get("min_price")
         if n in names and p:
+            if it.get("currency") not in (None, "EUR"):
+                raise SourceError(f"devise inattendue : {it.get('currency')}")
             out[n] = [round(float(p), 2), it.get("quantity")]
     return out
 
@@ -195,7 +222,7 @@ DM_PROBE = ["AK-47 | Bloodsport (Field-Tested)", "AWP | Asiimov (Field-Tested)",
             "★ Butterfly Knife | Doppler (Factory New)"]
 
 
-def fetch_dmarket(names, reference=None):
+def fetch_dmarket(names, reference_usd=None):
     titles = sorted(names)
     batches = [titles[i:i + 100] for i in range(0, len(titles), 100)]
     probe = [t for t in DM_PROBE if t in names] or titles[:5]
@@ -229,11 +256,11 @@ def fetch_dmarket(names, reference=None):
             out[n] = [v, int(q) if str(q or "").isdigit() else q]
 
     # Le format des prix DMarket varie selon l'endpoint (dollars ou centimes).
-    # On cale l'echelle sur une source de reference quand on en a une.
+    # On cale l'echelle sur une source de reference en dollars.
     scale = 1.0
-    if reference:
-        ratios = [out[n][0] / reference[n][0] for n in out
-                  if n in reference and reference[n][0]]
+    if reference_usd:
+        ratios = [out[n][0] / reference_usd[n][0] for n in out
+                  if n in reference_usd and reference_usd[n][0]]
         if len(ratios) >= 20:
             med = statistics.median(ratios)
             if 50 < med < 200:
@@ -254,7 +281,7 @@ STEAM_CATEGORIES = [
 
 def fetch_steam(names, budget_s=900, delay=4.0):
     """Renvoie (prix, complet). complet=False si le budget temps a coupe."""
-    out, t0 = {}, time.time()
+    out, t0, first = {}, time.time(), True
     for label, cat in STEAM_CATEGORIES:
         start, total = 0, None
         while total is None or start < total:
@@ -267,8 +294,11 @@ def fetch_steam(names, budget_s=900, delay=4.0):
                       "search_descriptions": 0, "sort_column": "name",
                       "sort_dir": "asc", "appid": 730, "norender": 1}
             params.update(cat)
+            # premiere requete : si l'IP du serveur est deja limitee par Steam,
+            # inutile d'insister plusieurs minutes, on reessaiera au run suivant
             r = http("GET", "https://steamcommunity.com/market/search/render/",
-                     params=params, retries=5)
+                     params=params, retries=2 if first else 5)
+            first = False
             if r.status_code != 200:
                 raise SourceError(f"HTTP {r.status_code} sur {label}")
             d = r.json()
@@ -304,15 +334,48 @@ def fetch_steam_weekly(names):
 
 
 def fetch_fx(previous):
-    try:
-        r = http("GET", "https://api.frankfurter.app/latest",
-                 params={"from": "USD", "to": "EUR"}, retries=2, timeout=20)
-        if r.status_code == 200:
-            return {"EUR": r.json()["rates"]["EUR"], "updated_at": now()}
-    except (SourceError, KeyError, ValueError):
-        pass
-    fx = (previous or {}).get("fx")
-    return fx or {"EUR": 0.86, "updated_at": None}
+    """Taux USD -> EUR de reference de la BCE (dernier jour ouvre)."""
+    tries = [
+        ("https://api.frankfurter.dev/v1/latest", {"base": "USD", "symbols": "EUR"}),
+        ("https://api.frankfurter.app/latest", {"from": "USD", "to": "EUR"}),
+    ]
+    for url, params in tries:
+        try:
+            r = http("GET", url, params=params, retries=2, timeout=20)
+            if r.status_code != 200:
+                continue
+            d = r.json()
+            rate = float(d["rates"]["EUR"])
+            if 0.5 < rate < 1.5:
+                return {"USD_EUR": round(rate, 6), "date": d.get("date"),
+                        "source": "BCE via " + url.split("/")[2],
+                        "updated_at": now(), "stale": False}
+        except (SourceError, KeyError, ValueError, TypeError):
+            continue
+    old = (previous or {}).get("fx") or {}
+    rate = old.get("USD_EUR") or old.get("EUR")
+    if rate:
+        return {"USD_EUR": rate, "date": old.get("date"), "source": old.get("source"),
+                "updated_at": old.get("updated_at"), "stale": True}
+    return {"USD_EUR": 0.86, "date": None, "source": "valeur par defaut",
+            "updated_at": None, "stale": True}
+
+
+def to_eur(data, cur, rate):
+    if cur == "EUR":
+        return data
+    return {n: [round(p * rate, 2), q] for n, (p, q) in data.items()}
+
+
+def consistency(items):
+    """Ecart median entre sources sur les items cotes des deux cotes."""
+    out = {}
+    for a, b in (("sk", "cf"), ("dm", "cf"), ("st", "cf"), ("dm", "sk")):
+        r = [v[a][0] / v[b][0] for v in items.values()
+             if a in v and b in v and v[b][0] >= 5 and v[a][0] > 0]
+        if len(r) >= 30:
+            out[f"{a}/{b}"] = {"median": round(statistics.median(r), 3), "n": len(r)}
+    return out
 
 
 # --------------------------------------------------------------------- main
@@ -352,27 +415,32 @@ def main():
     prev_items = (prev or {}).get("items", {})
     only = set(args.only.split(",")) if args.only else set(SOURCES)
 
+    fx = fetch_fx(prev)
+    rate = fx["USD_EUR"]
+    log(f"taux : 1 USD = {rate} EUR ({fx.get('source')}, {fx.get('date')})"
+        + (" -- ANCIEN" if fx.get("stale") else ""))
+    # un releve precedent en dollars (ancien format) est converti au taux du jour
+    prev_rate = rate if (prev or {}).get("currency", "USD") == "USD" else 1.0
+
     # "complete" = la source a ete relevee entierement : un item absent veut
     # alors dire "plus en vente", on ne reprend pas son ancien prix.
-    results, complete, status = {}, {}, {}
+    results, native, complete, status = {}, {}, {}, {}
     for src in SOURCES:
         k = KEYS[src]
         status[src] = {"label": LABELS[src], "ok": False, "updated_at": None,
-                       "count": 0, "error": None, "stale": False}
+                       "count": 0, "error": None, "stale": False,
+                       "native": NATIVE[src]}
         if src not in only:
             status[src]["error"] = "non interrogee"
             continue
 
         if src == "steam":
             last = prev_sources.get(k, {})
-            if last.get("ok") and not last.get("stale") and last.get("updated_at"):
-                age = (datetime.now(timezone.utc)
-                       - datetime.fromisoformat(last["updated_at"])).total_seconds()
-                if age < args.steam_every * 3600:
-                    # releve recent : on garde son statut tel quel (ok, date)
-                    status[src] = dict(last, skipped=True)
-                    log(f"[steam] saute : releve complet il y a {age / 3600:.1f} h")
-                    continue
+            if last.get("ok") and not last.get("stale") and age_h(last.get("updated_at")) < args.steam_every:
+                # releve recent : on garde son statut tel quel (ok, date)
+                status[src] = dict(last, skipped=True, native=NATIVE[src])
+                log(f"[steam] saute : releve complet il y a {age_h(last['updated_at']):.1f} h")
+                continue
 
         log(f"[{src}] ...")
         t = time.time()
@@ -383,14 +451,17 @@ def main():
             elif src == "csfloat":
                 data, stamp = fetch_csfloat(names), now()
             elif src == "dmarket":
-                data, stamp = fetch_dmarket(names, results.get("skinport")), now()
+                ref = native.get("csfloat") or {
+                    n: [p / rate, q] for n, (p, q) in native.get("skinport", {}).items()}
+                data, stamp = fetch_dmarket(names, ref), now()
             elif src == "steam":
                 (data, full), stamp = fetch_steam(names), now()
             else:
                 data, stamp = fetch_steam_weekly(names)
             if not data:
                 raise SourceError("aucun prix recupere")
-            results[src], complete[src] = data, full
+            native[src] = data
+            results[src], complete[src] = to_eur(data, NATIVE[src], rate), full
             status[src].update(ok=True, updated_at=stamp, count=len(data),
                                error=None if full else "releve partiel (budget temps)")
             log(f"[{src}] {len(data)} prix en {time.time() - t:.0f}s")
@@ -399,7 +470,7 @@ def main():
             log(f"[{src}] ECHEC : {status[src]['error']}")
 
     # Fusion : prix frais quand la source a repondu, sinon derniers prix
-    # connus de cette source (avec leur date d'origine, affichee sur le site).
+    # connus de cette source s'ils sont assez recents (date d'origine affichee).
     items = {}
     for src in SOURCES:
         k = KEYS[src]
@@ -408,24 +479,31 @@ def main():
             items.setdefault(n, {})[k] = v
         if complete.get(src):
             continue
+        old = prev_sources.get(k, {})
+        if src in LIVE and age_h(old.get("updated_at")) > MAX_CARRY_H:
+            if not fresh and old.get("updated_at"):
+                log(f"[{src}] ancien releve du {old.get('updated_at')} abandonne (> {MAX_CARRY_H} h)")
+            continue
         carried = 0
         for n, v in prev_items.items():
             if k in v and n in names and n not in fresh:
-                items.setdefault(n, {})[k] = v[k]
+                p, q = v[k]
+                items.setdefault(n, {})[k] = [round(p * prev_rate, 2), q]
                 carried += 1
         if carried and src not in results:
-            old = prev_sources.get(k, {})
             if not status[src].get("skipped"):
                 status[src].update(updated_at=old.get("updated_at"), stale=True)
             status[src]["count"] = carried
             log(f"[{src}] {carried} prix repris du releve du {old.get('updated_at')}")
 
+    checks = consistency(items)
     out = {
         "updated_at": now(),
-        "currency": "USD",
-        "fx": fetch_fx(prev),
+        "currency": "EUR",
+        "fx": fx,
         "order": [KEYS[s] for s in SOURCES],
         "sources": {KEYS[s]: status[s] for s in SOURCES},
+        "checks": checks,
         "items": dict(sorted(items.items())),
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -433,12 +511,20 @@ def main():
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
 
     covered = sum(1 for n in names if n in items)
-    log(f"\n{covered}/{len(names)} items cotes -> {args.out} "
-        f"({os.path.getsize(args.out) // 1024} Ko)")
+    live = sum(1 for n in names if any(k in items.get(n, {}) for k in ("sk", "cf", "dm", "st")))
+    log(f"\n{covered}/{len(names)} items cotes, dont {live} avec un prix live "
+        f"-> {args.out} ({os.path.getsize(args.out) // 1024} Ko)")
     for s in SOURCES:
         st = status[s]
         etat = "OK" if st["ok"] else ("ancien" if st["stale"] else "KO")
         log(f"  {LABELS[s]:<22}{etat:<8}{st['count']:>6}  {st['error'] or ''}")
+    log("\ncoherence entre sources (rapport median, ~1.0 attendu) :")
+    for pair, c in checks.items():
+        log(f"  {pair:<6} {c['median']:.3f}  sur {c['n']} items")
+    log("\ncontrole a l'oeil (EUR) :")
+    for n in SAMPLES:
+        v = items.get(n, {})
+        log(f"  {n:<46} " + "  ".join(f"{k}={v[k][0]:.2f}" for k in ("sk", "cf", "dm", "st", "fb") if k in v))
     # echec du job seulement si on n'a strictement rien
     return 0 if items else 1
 

@@ -38,7 +38,20 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   const methods = await p.$$eval("table.methods tbody tr", (rs) => rs.map((r) => r.innerText.replace(/\s+/g, " ").trim()));
   check("au moins un trade-up liste", methods.some((m) => /Trade-up/.test(m)), methods.join(" | ").slice(0, 300));
   check("hash de l'URL renseigne", (await p.evaluate(() => location.hash)).includes("Butterfly"));
-  check("bandeau prix anciens visible (aucune source live ici)", await p.isVisible("#stale"));
+  // le bandeau "prix anciens" doit apparaitre si et seulement si aucune source live n'est fraiche
+  const liveFresh = await p.evaluate(async () => {
+    const d = await (await fetch("data/prices.json", { cache: "no-store" })).json();
+    return ["sk", "cf", "dm", "st"].some((k) => {
+      const s = d.sources[k];
+      return s && s.count && s.updated_at && Date.now() - new Date(s.updated_at) < 6 * 3600000;
+    });
+  });
+  check("bandeau 'prix anciens' coherent avec la fraicheur des sources", (await p.isVisible("#stale")) === !liveFresh,
+        liveFresh ? "sources live fraiches" : "aucune source live fraiche");
+  check("euros par defaut", (await p.textContent("table.methods")).includes("€"));
+  check("ouverture de caisses hors du classement", !methods.some((m) => /Ouvrir/.test(m)));
+  check("ligne de comparaison caisses", /Pour comparaison, sans trade-up/.test(await p.textContent("#result")));
+  check("taux de change affiche", /taux BCE/.test(await p.textContent("#fx")), (await p.textContent("#fx")).trim().slice(0, 160));
   await p.screenshot({ path: path.join(out, "bureau-bfk-doppler.png"), fullPage: true });
 
   // usure minimale FN
@@ -55,10 +68,10 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   await p.uncheck("#st");
 
   // devise
-  await p.selectOption("#cur", "EUR");
-  await p.waitForTimeout(150);
-  check("conversion EUR", (await p.textContent("table.methods")).includes("€"));
   await p.selectOption("#cur", "USD");
+  await p.waitForTimeout(150);
+  check("bascule en dollars", (await p.textContent("table.methods")).includes("$"));
+  await p.selectOption("#cur", "EUR");
 
   // phase Doppler
   const before = await p.$eval("table.methods tbody tr:nth-child(1) td:nth-child(3)", (e) => e.innerText);
@@ -86,12 +99,21 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   await p.click('.ex[data-t="★ Karambit | Doppler"]');
   await p.waitForTimeout(200);
   check("bouton exemple -> Karambit Doppler", (await p.textContent(".target-card h2")).includes("Karambit | Doppler"));
+  await p.selectOption("#wear", "any");
+  await p.waitForTimeout(150);
+  const tip = await p.evaluate(() => {
+    const a = document.querySelector('[title*="sur CSFloat"]');
+    return a ? a.getAttribute("title") : null;
+  });
+  check("prix CSFloat : montant d'origine en $ au survol", !!tip && /\$/.test(tip), tip || "aucun");
+  check("ancien releve exclu par defaut", !(await p.isChecked('#srcs input[data-src="fb"]')));
 
-  // source decochee
-  await p.click('#srcs input[data-src="fb"]');
+  // toutes les sources live decochees -> pas de calcul avec de vieux prix
+  const liveBoxes = await p.$$eval('#srcs input[data-src]', (xs) => xs.filter((x) => x.checked).map((x) => x.dataset.src));
+  for (const k of liveBoxes) await p.click(`#srcs input[data-src="${k}"]`);
   await p.waitForTimeout(200);
-  check("toutes sources decochees -> message propre", /Aucun prix disponible|pas en vente|—/.test(await p.textContent("#result")));
-  await p.click('#srcs input[data-src="fb"]');
+  check("sans source live -> message clair, aucun calcul", /Aucune méthode chiffrable/.test(await p.textContent("#result")));
+  for (const k of liveBoxes) await p.click(`#srcs input[data-src="${k}"]`);
 
   // ----------------------------------------------------------------- mobile
   const m = await page({ width: 390, height: 844 });
