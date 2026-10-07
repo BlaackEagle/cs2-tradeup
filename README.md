@@ -28,12 +28,30 @@ Navigateur
 
 Chaque source de prix est indépendante : si l'une tombe (rate limit, API
 modifiée, clé absente), les autres continuent et ses derniers prix connus sont
-repris avec leur date d'origine. Le site affiche l'âge de chaque source et
-prévient quand aucun prix n'est en direct.
+repris **s'ils ont moins de 12 h**, avec leur date d'origine. Au-delà, l'item
+est marqué « pas en vente » plutôt que d'afficher un prix périmé. Le site
+affiche l'âge de chaque source et prévient quand aucun prix n'est en direct.
+
+| Source | Devise d'origine | Remarque |
+|---|---|---|
+| Skinport | € | API publique, tous les items en un appel |
+| CSFloat | $ → € | liste de prix, fonctionne sans clé pour l'instant |
+| DMarket | $ → € | meilleures offres par lots de 100 |
+| Steam Market | $ → € | Steam bloque souvent les serveurs GitHub (HTTP 429) : réessayé à chaque relevé |
+| Ancien relevé Steam | $ → € | données d'août 2026, **exclu des calculs par défaut** |
+
+**Tout est affiché en euros.** Les prix en dollars sont convertis au taux de
+référence BCE du jour (affiché en haut du site) ; au survol d'un prix
+CSFloat ou DMarket, le site montre son montant d'origine en dollars, pour
+comparer directement avec ce qu'affiche le marché.
+
+Chaque relevé imprime dans les logs du workflow un contrôle de cohérence
+entre marchés (rapport médian des prix, ~1,0 attendu) et un rapport calculé
+avec le moteur du site : ce que le site affiche pour quelques golds.
 
 ## Clé CSFloat (optionnelle)
 
-Sans clé, CSFloat peut refuser la liste de prix. Pour l'ajouter :
+Si CSFloat se met à refuser la liste de prix sans clé, ajoute-la :
 **Settings → Secrets and variables → Actions → New repository secret**,
 nom `CSFLOAT_API_KEY`, valeur = ta clé (csfloat.com → Profil → Developers).
 Elle reste chiffrée côté GitHub et n'apparaît jamais dans le site.

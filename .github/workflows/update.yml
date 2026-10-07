@@ -50,6 +50,28 @@ jobs:
       - name: Rapport (ce que le site va afficher)
         run: node tests/report.js || echo "::warning::rapport impossible"
 
+      # Test du site dans un vrai navigateur, sur les prix qui vont etre publies.
+      # Seulement sur push / lancement manuel, pas a chaque releve planifie.
+      - name: Test navigateur sur les prix reels
+        if: github.event_name != 'schedule'
+        continue-on-error: true
+        run: |
+          npm install -g playwright@1.56.1 > /dev/null
+          npx -y playwright@1.56.1 install --with-deps chromium > /dev/null
+          python -m http.server 8765 --directory site > /dev/null 2>&1 &
+          sleep 1
+          mkdir -p "$RUNNER_TEMP/captures"
+          node tests/ui_check.js http://127.0.0.1:8765/ "$RUNNER_TEMP/captures"
+
+      - name: Captures d'ecran
+        if: always() && github.event_name != 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: captures
+          path: ${{ runner.temp }}/captures
+          retention-days: 7
+          if-no-files-found: ignore
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
