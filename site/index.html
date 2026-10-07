@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trade-Up Gold CS2</title>
+  <meta name="description" content="Simulateur CS2 : la façon la moins chère d'obtenir un couteau ou des gants précis — achat direct, trade-up 5 Coverts ou ouverture de caisses, avec les prix de Skinport, CSFloat, DMarket et Steam.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23e4ae39' d='M4 26 22 8l4-4-1 6-17 18z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <h1>Trade-Up <span>Gold</span> CS2</h1>
+      <p class="sub">La façon la moins chère d'obtenir un couteau ou des gants précis : achat direct, trade-up 5 Coverts ou ouverture de caisses.</p>
+      <div id="sources" class="sources" aria-label="Fraîcheur des prix par source"></div>
+      <p id="updated" class="muted small"></p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="stale" class="warn-box" hidden></div>
+
+    <section class="card controls" aria-label="Paramètres">
+      <label class="target">
+        <span>Gold visé</span>
+        <input id="target" list="golds" placeholder="ex. ★ Butterfly Knife | Doppler" autocomplete="off" spellcheck="false">
+        <datalist id="golds"></datalist>
+      </label>
+      <div id="examples" class="examples"></div>
+      <div class="row">
+        <label>Usure minimale <select id="wear"></select></label>
+        <label class="check"><input type="checkbox" id="st"> StatTrak™</label>
+        <label>Devise
+          <select id="cur"><option value="USD">USD $</option><option value="EUR">EUR €</option></select>
+        </label>
+      </div>
+      <details class="adv">
+        <summary>Options avancées</summary>
+        <div class="row">
+          <label>Phases Doppler
+            <select id="phase">
+              <option value="merged">Une finition = une chance (défaut)</option>
+              <option value="entries">Chaque phase = une chance</option>
+            </select>
+          </label>
+          <label>Formule du float
+            <select id="formula">
+              <option value="normalized">Normalisée par skin (défaut)</option>
+              <option value="raw">Moyenne brute (ancienne)</option>
+            </select>
+          </label>
+          <label>Frais de revente (%)
+            <input id="fee" type="number" min="0" max="30" step="0.5" inputmode="decimal">
+          </label>
+        </div>
+        <div class="row" id="srcs" aria-label="Sources de prix utilisées"></div>
+        <p class="muted small">Décoche un site si tu ne peux pas y acheter : les calculs se refont sans lui.</p>
+      </details>
+    </section>
+
+    <section id="result" aria-live="polite"><div class="card empty">Chargement des prix…</div></section>
+
+    <section class="card notes">
+      <h2>Règles et hypothèses</h2>
+      <ul>
+        <li><b>Contrat Covert → gold</b> (mise à jour du 23 octobre 2025) : 5 Coverts, tous StatTrak™ ou tous normaux, donnent un couteau ou des gants des caisses dont ils viennent. Chaque input pèse 1/5 : 3 inputs Spectrum 2 = 60 % de chances que le gold sorte du pool Spectrum 2. Un contrat StatTrak™ ne donne que des couteaux.</li>
+        <li><b>Dans le pool</b>, chaque finition est supposée avoir la même chance. Valve ne publie pas ces taux : c'est l'hypothèse des calculateurs communautaires. Pour les Doppler, les sources ne s'accordent pas sur le poids des phases : l'option avancée « chaque phase = une chance » montre l'autre lecture, et change beaucoup le résultat pour un Doppler.</li>
+        <li><b>Float de sortie</b> = min + moyenne des positions des inputs × (max − min) du gold obtenu. L'optimiseur prend le pire float possible de chaque palier d'usure acheté, donc l'usure annoncée est garantie.</li>
+        <li><b>Coût moyen pour avoir la cible</b> = (prix du contrat − revente moyenne des autres golds) ÷ chance de la cible. C'est une moyenne : un contrat peut te donner la cible du premier coup, ou pas avant des dizaines d'essais.</li>
+        <li><b>Prix</b> = annonce la moins chère parmi les sites cochés. Les inputs sont achetés au prix le plus bas, la revente se fait au prix le plus bas moins tes frais. Seule la phase la moins chère d'un Doppler est cotée.</li>
+        <li>Les golds reçus sont bloqués 7 jours. Les prix bougent vite depuis cette mise à jour : vérifie chaque prix sur le site avant d'acheter.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="wrap muted small">
+    Données de jeu : <a href="https://github.com/ByMykel/CSGO-API" rel="noopener">ByMykel/CSGO-API</a>.
+    Prix : Skinport, CSFloat, DMarket, Steam Market. Outil indépendant, non affilié à Valve.
+  </footer>
+
+  <script src="engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
