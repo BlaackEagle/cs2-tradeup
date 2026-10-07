@@ -147,14 +147,16 @@ def fetch_skinport(names):
              headers={"Accept-Encoding": "br"})
     if r.status_code != 200:
         raise SourceError(f"HTTP {r.status_code}: {r.text[:200]}")
-    out = {}
+    out = Prices()
     for it in r.json():
         n = it.get("market_hash_name")
         p = it.get("min_price")
         if n in names and p:
             if it.get("currency") not in (None, "EUR"):
                 raise SourceError(f"devise inattendue : {it.get('currency')}")
-            out[n] = [round(float(p), 2), it.get("quantity")]
+            out.add(n, round(float(p), 2), it.get("quantity"))
+    if out.dupes:
+        log(f"    {out.dupes} lignes en double (phases), prix le plus bas retenu")
     return out
 
 
@@ -174,12 +176,14 @@ def fetch_csfloat(names):
     data = r.json()
     if isinstance(data, dict):
         data = data.get("data") or data.get("items") or []
-    out = {}
+    out = Prices()
     for it in data:
         n = it.get("market_hash_name")
         p = it.get("min_price")
         if n in names and p:
-            out[n] = [round(p / 100.0, 2), it.get("quantity")]   # centimes
+            out.add(n, round(p / 100.0, 2), it.get("quantity"))   # centimes
+    if out.dupes:
+        log(f"    {out.dupes} lignes en double (phases), prix le plus bas retenu")
     return out
 
 
@@ -253,7 +257,9 @@ def fetch_dmarket(names, reference_usd=None):
     for n, (p, q) in raw.items():
         v = _num(p)
         if n in names and v:
-            out[n] = [v, int(q) if str(q or "").isdigit() else q]
+            q = int(q) if str(q or "").isdigit() else q
+            if n not in out or v < out[n][0]:
+                out[n] = [v, q]
 
     # Le format des prix DMarket varie selon l'endpoint (dollars ou centimes).
     # On cale l'echelle sur une source de reference en dollars.
@@ -314,8 +320,9 @@ def fetch_steam(names, budget_s=900, delay=4.0):
                 if start == 0 and "$" not in txt:
                     raise SourceError(f"devise inattendue : {txt!r}")
                 if n in names and it.get("sell_price"):
-                    out[n] = [round(it["sell_price"] / 100.0, 2),
-                              it.get("sell_listings")]
+                    p = round(it["sell_price"] / 100.0, 2)
+                    if n not in out or p < out[n][0]:
+                        out[n] = [p, it.get("sell_listings")]
             start += len(results)
             time.sleep(delay)
         log(f"    {label} : {total} resultats parcourus")
@@ -359,6 +366,26 @@ def fetch_fx(previous):
                 "updated_at": old.get("updated_at"), "stale": True}
     return {"USD_EUR": 0.86, "date": None, "source": "valeur par defaut",
             "updated_at": None, "stale": True}
+
+
+class Prices(dict):
+    """{nom: [prix, quantite]} qui garde le prix le plus bas quand un nom
+    revient plusieurs fois (une ligne par phase Doppler chez certains marches)."""
+
+    def __init__(self):
+        super().__init__()
+        self.dupes = 0
+
+    def add(self, name, price, qty):
+        cur = self.get(name)
+        if cur is None:
+            self[name] = [price, qty]
+            return
+        self.dupes += 1
+        if price < cur[0]:
+            cur[0] = price
+        if isinstance(qty, int) and isinstance(cur[1], int):
+            cur[1] += qty
 
 
 def to_eur(data, cur, rate):

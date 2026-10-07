@@ -43,6 +43,13 @@ jobs:
           repo="${GITHUB_REPOSITORY#*/}"
           python scripts/fetch_prices.py --previous "https://${owner}.github.io/${repo}/data/prices.json"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Rapport (ce que le site va afficher)
+        run: node tests/report.js || echo "::warning::rapport impossible"
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
