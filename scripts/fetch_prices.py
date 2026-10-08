@@ -340,6 +340,33 @@ def fetch_steam_weekly(names):
     return out, d.get("metadata", {}).get("updated_at")
 
 
+def fetch_tradeit(catalog, names):
+    """
+    Prix d'echange tradeit (priceForTrade) des Coverts en stock, en dollars.
+    C'est la monnaie d'echange de tradeit (gonflee d'environ x1,8 par rapport
+    au marche) : elle ne se compare qu'a la valeur d'echange de tes items.
+    """
+    out = {}
+    for base_name in sorted(catalog["coverts"]):
+        r = http("GET", "https://tradeit.gg/api/v2/inventory/data", retries=3,
+                 params={"gameId": 730, "offset": 0, "limit": 200, "searchValue": base_name},
+                 headers={"Referer": "https://tradeit.gg/csgo/trade"})
+        if r.status_code != 200:
+            raise SourceError(f"HTTP {r.status_code} sur {base_name}")
+        d = r.json()
+        counts = d.get("counts") or {}
+        for it in d.get("items") or []:
+            n, p = it.get("name"), it.get("priceForTrade") or it.get("price")
+            if n not in names or not p:
+                continue
+            qty = counts.get(str(it.get("groupId"))) or 1
+            v = round(p / 100.0, 2)
+            if n not in out or v < out[n][0]:
+                out[n] = [v, qty]
+        time.sleep(0.35)
+    return out
+
+
 def fetch_fx(previous):
     """Taux USD -> EUR de reference de la BCE (dernier jour ouvre)."""
     tries = [
@@ -440,7 +467,7 @@ def main():
     prev = (load_previous(args.previous) if args.previous else None) or load_previous(args.out)
     prev_sources = (prev or {}).get("sources", {})
     prev_items = (prev or {}).get("items", {})
-    only = set(args.only.split(",")) if args.only else set(SOURCES)
+    only = set(args.only.split(",")) if args.only else set(SOURCES) | {"tradeit"}
 
     fx = fetch_fx(prev)
     rate = fx["USD_EUR"]
@@ -523,6 +550,32 @@ def main():
             status[src]["count"] = carried
             log(f"[{src}] {carried} prix repris du releve du {old.get('updated_at')}")
 
+    # tradeit : prix d'echange des Coverts, a part des prix de marche
+    tstat = {"label": "tradeit (échange)", "ok": False, "updated_at": None, "count": 0,
+             "error": None, "stale": False}
+    if "tradeit" in only:
+        log("[tradeit] ...")
+        try:
+            tt = fetch_tradeit(catalog, names)
+            if not tt:
+                raise SourceError("aucun Covert en stock")
+            for n, (p, q) in tt.items():
+                items.setdefault(n, {})["tt"] = [round(p * rate, 2), q]
+            tstat.update(ok=True, updated_at=now(), count=len(tt))
+            log(f"[tradeit] {len(tt)} prix d'echange de Coverts")
+        except Exception as e:                   # noqa: BLE001
+            tstat["error"] = str(e)[:300]
+            log(f"[tradeit] ECHEC : {tstat['error']}")
+            old = (prev or {}).get("tradeit") or {}
+            if age_h(old.get("updated_at")) <= MAX_CARRY_H:
+                carried = 0
+                for n, v in prev_items.items():
+                    if "tt" in v and n in names:
+                        p, q = v["tt"]
+                        items.setdefault(n, {})["tt"] = [round(p * prev_rate, 2), q]
+                        carried += 1
+                tstat.update(updated_at=old.get("updated_at"), count=carried, stale=True)
+
     checks = consistency(items)
     out = {
         "updated_at": now(),
@@ -530,6 +583,7 @@ def main():
         "fx": fx,
         "order": [KEYS[s] for s in SOURCES],
         "sources": {KEYS[s]: status[s] for s in SOURCES},
+        "tradeit": tstat,
         "checks": checks,
         "items": dict(sorted(items.items())),
     }

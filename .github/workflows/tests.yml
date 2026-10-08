@@ -14,3 +14,4 @@ jobs:
         with:
           node-version: "22"
       - run: node tests/engine.test.js
+      - run: node tests/vault.test.js

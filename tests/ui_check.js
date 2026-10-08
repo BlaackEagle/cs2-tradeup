@@ -1,138 +1,172 @@
-// Pilote le site dans Chromium : node tests/ui_check.js http://127.0.0.1:8765/ dossier_captures
+// Pilote le site dans Chromium :
+//   node tests/ui_check.js http://127.0.0.1:8765/ dossier_captures [phrase_inventaire]
 "use strict";
 const path = require("path");
 const { chromium } = require(path.join(require("child_process").execSync("npm root -g").toString().trim(), "playwright"));
 
 (async () => {
-  const url = process.argv[2];
-  const out = process.argv[3];
+  const [url, out, pass] = process.argv.slice(2);
   const browser = await chromium.launch();
   const errors = [];
   const results = [];
-  const check = (name, ok, detail) => { results.push([ok, name, detail || ""]); };
+  const check = (name, ok, detail) => results.push([!!ok, name, detail || ""]);
 
   async function page(viewport) {
     const ctx = await browser.newContext({ viewport, deviceScaleFactor: 1 });
     const p = await ctx.newPage();
     p.on("pageerror", (e) => errors.push("pageerror: " + e.message));
-    // les echecs de chargement sont juges par requestfailed ci-dessous
-    p.on("console", (m) => {
-      if (m.type() === "error" && !/Failed to load resource/.test(m.text())) errors.push("console: " + m.text());
-    });
+    p.on("console", (m) => { if (m.type() === "error" && !/Failed to load resource/.test(m.text())) errors.push("console: " + m.text()); });
     // seules les images du CDN Steam sont tolerees (bloquees dans l'environnement de test)
     p.on("requestfailed", (r) => {
       const host = new URL(r.url()).host;
-      if (!(r.resourceType() === "image" && host.endsWith("steamstatic.com"))) {
-        errors.push(`requete en echec : ${r.resourceType()} ${r.url()}`);
-      }
+      if (!(r.resourceType() === "image" && /steamstatic\.com|akamaihd\.net/.test(host))) errors.push(`requete en echec : ${r.resourceType()} ${r.url()}`);
     });
     return p;
   }
+  const text = async (p, s) => ((await p.textContent(s)) || "").replace(/\s+/g, " ").trim();
 
-  // ----------------------------------------------------------------- bureau
   const p = await page({ width: 1280, height: 900 });
   await p.goto(url, { waitUntil: "networkidle" });
-  await p.waitForSelector("table.methods", { timeout: 15000 });
-  const verdict = await p.textContent(".verdict");
-  check("verdict affiche", /moins cher/i.test(verdict), verdict.trim().slice(0, 160));
-  const methods = await p.$$eval("table.methods tbody tr", (rs) => rs.map((r) => r.innerText.replace(/\s+/g, " ").trim()));
-  check("au moins un trade-up liste", methods.some((m) => /Trade-up/.test(m)), methods.join(" | ").slice(0, 300));
-  check("hash de l'URL renseigne", (await p.evaluate(() => location.hash)).includes("Butterfly"));
-  // le bandeau "prix anciens" doit apparaitre si et seulement si aucune source live n'est fraiche
-  const liveFresh = await p.evaluate(async () => {
-    const d = await (await fetch("data/prices.json", { cache: "no-store" })).json();
-    return ["sk", "cf", "dm", "st"].some((k) => {
-      const s = d.sources[k];
-      return s && s.count && s.updated_at && Date.now() - new Date(s.updated_at) < 6 * 3600000;
-    });
-  });
-  check("bandeau 'prix anciens' coherent avec la fraicheur des sources", (await p.isVisible("#stale")) === !liveFresh,
-        liveFresh ? "sources live fraiches" : "aucune source live fraiche");
-  check("euros par defaut", (await p.textContent("table.methods")).includes("€"));
-  check("ouverture de caisses hors du classement", !methods.some((m) => /Ouvrir/.test(m)));
-  check("ligne de comparaison caisses", /Pour comparaison, sans trade-up/.test(await p.textContent("#result")));
-  check("taux de change affiche", /taux BCE/.test(await p.textContent("#fx")), (await p.textContent("#fx")).trim().slice(0, 160));
-  await p.screenshot({ path: path.join(out, "bureau-bfk-doppler.png"), fullPage: true });
+  await p.evaluate(() => localStorage.clear());
+  await p.reload({ waitUntil: "networkidle" });
+  await p.waitForSelector("#slots .slot");
 
-  // usure minimale FN
-  await p.selectOption("#wear", "Factory New");
+  // ------------------------------------------------------------ constructeur
+  check("onglet Constructeur par defaut", (await p.getAttribute('.tabs [data-tab="builder"]', "aria-selected")) === "true");
+  check("5 cases vides", (await p.$$eval("#slots .slot.empty", (x) => x.length)) === 5);
+  check("message d'accueil", /Ajoute des Coverts/.test(await text(p, "#b-result")));
+
+  await p.click('#slots [data-slot="0"]');
+  await p.waitForSelector("#picker[open]");
+  check("selecteur ouvert", true);
+  await p.fill("#pk-q", "Empress");
+  await p.waitForTimeout(100);
+  const listed = await p.$$eval("#pk-list .pk-item", (x) => x.map((e) => e.dataset.pick));
+  check("recherche « Empress »", listed.length === 1 && listed[0] === "AK-47 | The Empress", listed.join(", "));
+  await p.click('#pk-list [data-pick="AK-47 | The Empress"]');
+  await p.click('#pk-detail [data-wear="Field-Tested"]');
+  const ftPrice = await text(p, '#pk-detail [data-wear="Field-Tested"] small');
+  await p.click("#pk-fill");
   await p.waitForTimeout(150);
-  const fnTxt = await p.textContent("#result");
-  check("mode FN : float de sortie < 0.07", /Factory New \(float de sortie < 0\.0[0-6]\d\d\)|Factory New \(float de sortie < 0\.0700\)/.test(fnTxt));
+  check("5 cases remplies", (await p.$$eval("#slots .slot.filled", (x) => x.length)) === 5);
+  check("selecteur referme", !(await p.$("#picker[open]")));
+  const kpis = await p.$$eval(".kpi", (x) => x.map((e) => e.innerText.replace(/\s+/g, " ")));
+  // les titres sont en majuscules par le style : comparaison insensible a la casse
+  check("synthese : cout, valeur, profit, chance, meilleur, pire", kpis.length >= 6 && /Coût du contrat/i.test(kpis[0])
+        && ["Valeur moyenne", "Profit moyen", "Chance de profit", "Meilleur cas", "Pire cas"].every((k) => new RegExp(k, "i").test(kpis.join(" "))),
+        kpis.slice(0, 3).join(" | "));
+  const cost = parseFloat(kpis[0].match(/([\d\s ,]+)\s*€/)[1].replace(/[\s ]/g, "").replace(",", "."));
+  const unit = parseFloat(ftPrice.replace(/[\s €]/g, "").replace(",", "."));
+  check("cout = 5 × prix FT", Math.abs(cost - 5 * unit) < 0.02, `${cost} vs 5 × ${unit}`);
+  check("30 resultats (pool Spectrum 2)", (await p.$$eval(".ocgrid .oc", (x) => x.length)) === 30);
+  check("barre de probabilites", (await p.$$eval(".probbar i", (x) => x.length)) === 30);
+  check("cartes gain/perte colorees", (await p.$$eval(".oc.w, .oc.l", (x) => x.length)) > 0);
+  await p.screenshot({ path: path.join(out, "constructeur.png"), fullPage: true });
+
+  // float exact + prix impose sur la case 2
+  await p.click('#slots [data-slot="1"]');
+  await p.waitForSelector("#picker[open]");
+  await p.fill("#pk-float", "0.2");
+  await p.fill("#pk-price", "50");
+  await p.click("#pk-put");
+  await p.waitForTimeout(150);
+  const s2 = await text(p, '#slots [data-slot="1"]');
+  check("float exact affiche", /float 0,2000|float 0\.2000/.test(s2), s2);
+  check("prix impose affiche", /50,00\s*€/.test(s2) && /ton prix/.test(s2), s2);
+
+  // retrait d'une case
+  await p.click('#slots [data-remove="4"]');
+  await p.waitForTimeout(100);
+  check("case retiree -> contrat incomplet", /Encore 1 Covert/.test(await text(p, "#b-result")));
+  await p.click("#b-dup");
+  await p.waitForTimeout(100);
+  check("copier le dernier dans les cases vides", (await p.$$eval("#slots .slot.filled", (x) => x.length)) === 5);
 
   // StatTrak
   await p.check("#st");
-  await p.waitForTimeout(150);
-  const stTxt = await p.textContent("#result");
-  check("mode StatTrak : inputs StatTrak", /StatTrak™ (AK-47|P250|USP-S)/.test(stTxt));
+  await p.waitForTimeout(200);
+  check("StatTrak : inputs StatTrak", /StatTrak™ AK-47/.test(await text(p, "#slots")));
+  const ocNames = await p.$$eval(".ocgrid .oc-n", (x) => x.map((e) => e.innerText));
+  check("StatTrak : resultats StatTrak", ocNames.length > 0 && ocNames.every((n) => /StatTrak™/.test(n)));
   await p.uncheck("#st");
 
   // devise
   await p.selectOption("#cur", "USD");
-  await p.waitForTimeout(150);
-  check("bascule en dollars", (await p.textContent("table.methods")).includes("$"));
+  await p.waitForTimeout(100);
+  check("bascule en dollars", /\$/.test(await text(p, ".kpis")));
   await p.selectOption("#cur", "EUR");
 
-  // phase Doppler
-  const before = await p.$eval("table.methods tbody tr:nth-child(1) td:nth-child(3)", (e) => e.innerText);
-  await p.selectOption("#wear", "any");
-  await p.click(".adv summary");
-  await p.selectOption("#phase", "entries");
-  await p.waitForTimeout(150);
-  const tuChance = await p.$$eval("table.methods tbody tr", (rs) => rs.map((r) => r.innerText).find((t) => /Trade-up/.test(t)) || "");
-  check("mode phases : chance ~11,7 % pour un BFK Doppler 100 % Spectrum", /11,6|11,7/.test(tuChance), tuChance.replace(/\s+/g, " "));
-  await p.selectOption("#phase", "merged");
-  void before;
-
-  // gants : pas de StatTrak, gants FN impossibles par palier
-  await p.fill("#target", "★ Sport Gloves | Vice");
-  await p.dispatchEvent("#target", "input");
+  // ------------------------------------------------------------ gold vise
+  await p.click('.tabs [data-tab="target"]');
+  await p.waitForSelector("#t-result .method");
+  const methods = await p.$$eval("#t-result .method h3", (x) => x.map((e) => e.innerText));
+  check("gold vise : methodes listees", methods.some((m) => /Trade-up/.test(m)), methods.join(" | "));
+  await p.click('#t-result [data-load]');
   await p.waitForTimeout(200);
-  check("gants : case StatTrak desactivee", await p.isDisabled("#st"));
-  await p.selectOption("#wear", "Factory New");
-  await p.waitForTimeout(200);
-  const glove = await p.textContent("#result");
-  check("gants FN : note de float explicative", /Impossible de garantir/.test(glove));
-  await p.screenshot({ path: path.join(out, "bureau-gants-fn.png"), fullPage: false });
+  check("gold vise -> charge dans le constructeur", (await p.getAttribute('.tabs [data-tab="builder"]', "aria-selected")) === "true"
+        && (await p.$$eval("#slots .slot.filled", (x) => x.length)) === 5);
 
-  // exemple cliquable
-  await p.click('.ex[data-t="★ Karambit | Doppler"]');
+  // ------------------------------------------------------- meilleurs contrats
+  await p.click('.tabs [data-tab="best"]');
+  await p.waitForSelector("#best-list .bc");
+  const nbc = await p.$$eval("#best-list .bc", (x) => x.length);
+  check("meilleurs contrats : une carte par caisse", nbc >= 30, `${nbc} cartes`);
+  const profits = await p.$$eval("#best-list .bc .side b", (x) => x.map((e) => parseFloat(e.innerText.replace(/[^\d,−-]/g, "").replace("−", "-").replace(",", "."))));
+  check("tri par profit decroissant", profits.every((v, i) => i === 0 || v <= profits[i - 1] + 1e-9));
+  await p.fill("#best-budget", "200");
+  await p.dispatchEvent("#best-budget", "change");
   await p.waitForTimeout(200);
-  check("bouton exemple -> Karambit Doppler", (await p.textContent(".target-card h2")).includes("Karambit | Doppler"));
-  await p.selectOption("#wear", "any");
-  await p.waitForTimeout(150);
-  const tip = await p.evaluate(() => {
-    const a = document.querySelector('[title*="sur CSFloat"]');
-    return a ? a.getAttribute("title") : null;
-  });
-  check("prix CSFloat : montant d'origine en $ au survol", !!tip && /\$/.test(tip), tip || "aucun");
-  check("ancien releve exclu par defaut", !(await p.isChecked('#srcs input[data-src="fb"]')));
-
-  // toutes les sources live decochees -> pas de calcul avec de vieux prix
-  const liveBoxes = await p.$$eval('#srcs input[data-src]', (xs) => xs.filter((x) => x.checked).map((x) => x.dataset.src));
-  for (const k of liveBoxes) await p.click(`#srcs input[data-src="${k}"]`);
+  const costs = await p.$$eval("#best-list .bc .meta-row span:first-child b", (x) => x.map((e) => parseFloat(e.innerText.replace(/[^\d,]/g, "").replace(",", "."))));
+  check("budget max respecte", costs.length > 0 && costs.every((c) => c <= 200.001), `${costs.length} contrats ≤ 200 €`);
+  await p.screenshot({ path: path.join(out, "meilleurs.png"), fullPage: false });
+  await p.click("#best-list [data-load]");
   await p.waitForTimeout(200);
-  check("sans source live -> message clair, aucun calcul", /Aucune méthode chiffrable/.test(await p.textContent("#result")));
-  for (const k of liveBoxes) await p.click(`#srcs input[data-src="${k}"]`);
+  check("meilleur contrat -> constructeur", (await p.$$eval("#slots .slot.filled", (x) => x.length)) === 5);
 
-  // ----------------------------------------------------------------- mobile
+  // ------------------------------------------------------- inventaire tradeit
+  await p.click('.tabs [data-tab="tradeit"]');
+  await p.waitForSelector("#ti-root .panel");
+  if (pass) {
+    check("inventaire chiffre : formulaire de deverrouillage", !!(await p.$("#ti-unlock")));
+    await p.fill("#ti-pass", "mauvaise");
+    await p.click('#ti-unlock button[type="submit"]');
+    await p.waitForTimeout(800);
+    check("mauvaise phrase refusee", /incorrecte/.test(await text(p, "#ti-err")));
+    await p.fill("#ti-pass", pass);
+    await p.click('#ti-unlock button[type="submit"]');
+    await p.waitForSelector("#ti-root table", { timeout: 10000 });
+    const rows = await p.$$eval("#ti-root tbody tr", (x) => x.length);
+    check("inventaire dechiffre : 3 items", rows === 3, `${rows} lignes`);
+    const before = await text(p, "#ti-root .kpi:first-child b");
+    await p.click("#ti-root tbody tr:first-child input[type=checkbox]");
+    await p.waitForTimeout(200);
+    check("decocher un item change la valeur d'echange", before !== (await text(p, "#ti-root .kpi:first-child b")));
+    check("comparaison marche / echange", /Voie marché/.test(await text(p, "#ti-root")) && /Voie échange tradeit/.test(await text(p, "#ti-root")));
+    await p.screenshot({ path: path.join(out, "tradeit.png"), fullPage: true });
+    await p.click('#ti-root [data-pay="tradeit"]');
+    await p.click('.tabs [data-tab="builder"]');
+    await p.waitForTimeout(200);
+    check("inputs payes en echange tradeit", (await p.$$eval("#slots .src.ti", (x) => x.length)) === 5);
+    await p.reload({ waitUntil: "networkidle" });
+    await p.click('.tabs [data-tab="tradeit"]');
+    await p.waitForSelector("#ti-root table", { timeout: 10000 });
+    check("phrase memorisee sur l'appareil", true);
+  } else {
+    // sans phrase : soit l'inventaire n'est pas configure, soit il est publie chiffre
+    const t = await text(p, "#ti-root");
+    check("onglet tradeit : instructions ou deverrouillage", /STEAM_ID/.test(t) || !!(await p.$("#ti-unlock")), t.slice(0, 90));
+  }
+
+  // ------------------------------------------------------------------ mobile
   const m = await page({ width: 390, height: 844 });
-  await m.goto(url + "#t=" + encodeURIComponent("★ Butterfly Knife | Doppler"), { waitUntil: "networkidle" });
-  await m.waitForSelector("table.methods");
+  await m.goto(url, { waitUntil: "networkidle" });
+  await m.waitForSelector("#slots .slot");
   const overflow = await m.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-  check("mobile : pas de scroll horizontal de page", overflow <= 0, `debordement ${overflow}px`);
-  await m.screenshot({ path: path.join(out, "mobile-bfk-doppler.png"), fullPage: true });
-
-  // ------------------------------------------------------------------ sombre
-  const d = await browser.newContext({ viewport: { width: 1280, height: 900 }, colorScheme: "dark" });
-  const dp = await d.newPage();
-  dp.on("pageerror", (e) => errors.push("pageerror: " + e.message));
-  await dp.goto(url, { waitUntil: "networkidle" });
-  await dp.waitForSelector("table.methods");
-  await dp.screenshot({ path: path.join(out, "bureau-sombre.png"), fullPage: false });
+  check("mobile : pas de scroll horizontal", overflow <= 0, `debordement ${overflow}px`);
+  await m.screenshot({ path: path.join(out, "mobile.png"), fullPage: true });
 
   await browser.close();
-  check("aucune erreur JavaScript", errors.length === 0, errors.join(" || "));
+  check("aucune erreur JavaScript", errors.length === 0, errors.slice(0, 3).join(" || "));
   for (const [ok, name, detail] of results) console.log(`${ok ? "ok   " : "ECHEC"} ${name}${detail ? "  — " + detail : ""}`);
   process.exitCode = results.every((r) => r[0]) ? 0 : 1;
 })().catch((e) => { console.error(e); process.exit(2); });

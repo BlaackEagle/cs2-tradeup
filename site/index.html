@@ -6,41 +6,40 @@
   <!-- pas de referencement : le site reste accessible a qui a l'adresse -->
   <meta name="robots" content="noindex, nofollow">
   <title>Trade-Up Gold CS2</title>
-  <meta name="description" content="Simulateur CS2 : la façon la moins chère d'obtenir un couteau ou des gants précis — achat direct, trade-up 5 Coverts ou ouverture de caisses, avec les prix de Skinport, CSFloat, DMarket et Steam.">
+  <meta name="description" content="Simulateur de contrats CS2 Covert → couteau ou gants : résultats possibles, chances, profit et ROI avec les prix actuels.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23e4ae39' d='M4 26 22 8l4-4-1 6-17 18z'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="top">
-    <div class="wrap">
-      <h1>Trade-Up <span>Gold</span> CS2</h1>
-      <p class="sub">La façon la moins chère d'obtenir un couteau ou des gants précis : achat direct, trade-up 5 Coverts ou ouverture de caisses.</p>
-      <div id="sources" class="sources" aria-label="Fraîcheur des prix par source"></div>
-      <p id="updated" class="muted small"></p>
-      <p id="fx" class="muted small"></p>
+    <div class="wrap top-row">
+      <div class="brand">
+        <h1>Trade-Up <span>Gold</span></h1>
+        <p class="sub">Contrats 5 Coverts → couteau ou gants, avec les prix actuels.</p>
+      </div>
+      <div class="top-meta">
+        <div id="sources" class="sources" aria-label="Fraîcheur des prix par source"></div>
+        <p id="fx" class="muted small"></p>
+      </div>
     </div>
+    <nav class="wrap tabs" role="tablist" aria-label="Sections">
+      <button type="button" role="tab" data-tab="builder">Constructeur</button>
+      <button type="button" role="tab" data-tab="target">Gold visé</button>
+      <button type="button" role="tab" data-tab="best">Meilleurs contrats</button>
+      <button type="button" role="tab" data-tab="tradeit">Inventaire tradeit</button>
+    </nav>
   </header>
 
   <main class="wrap">
     <div id="stale" class="warn-box" hidden></div>
 
-    <section class="card controls" aria-label="Paramètres">
-      <label class="target">
-        <span>Gold visé</span>
-        <input id="target" list="golds" placeholder="ex. ★ Butterfly Knife | Doppler" autocomplete="off" spellcheck="false">
-        <datalist id="golds"></datalist>
-      </label>
-      <div id="examples" class="examples"></div>
-      <div class="row">
-        <label>Usure minimale <select id="wear"></select></label>
-        <label class="check"><input type="checkbox" id="st"> StatTrak™</label>
-        <label>Devise
-          <select id="cur"><option value="EUR">EUR €</option><option value="USD">USD $</option></select>
-        </label>
-      </div>
+    <section class="toolbar" aria-label="Options">
+      <label class="switch"><input type="checkbox" id="st"><span>StatTrak™</span></label>
+      <label>Devise <select id="cur"><option value="EUR">EUR €</option><option value="USD">USD $</option></select></label>
+      <label>Frais de revente <span class="inline"><input id="fee" type="number" min="0" max="30" step="0.5" inputmode="decimal"> %</span></label>
       <details class="adv">
         <summary>Options avancées</summary>
-        <div class="row">
+        <div class="adv-body">
           <label>Phases Doppler
             <select id="phase">
               <option value="merged">Une finition = une chance (défaut)</option>
@@ -53,38 +52,105 @@
               <option value="raw">Moyenne brute (ancienne)</option>
             </select>
           </label>
-          <label>Frais de revente (%)
-            <input id="fee" type="number" min="0" max="30" step="0.5" inputmode="decimal">
-          </label>
+          <div id="srcs" class="srcs" aria-label="Sources de prix utilisées"></div>
         </div>
-        <div class="row" id="srcs" aria-label="Sources de prix utilisées"></div>
-        <p class="muted small">Décoche un site si tu ne peux pas y acheter : les calculs se refont sans lui.</p>
       </details>
     </section>
 
-    <section id="result" aria-live="polite"><div class="card empty">Chargement des prix…</div></section>
+    <!-- ============================================================ constructeur -->
+    <section id="tab-builder" class="tab" role="tabpanel">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Tes 5 Coverts</h2>
+          <div class="btns">
+            <button type="button" class="btn ghost" id="b-dup">Copier le dernier dans les cases vides</button>
+            <button type="button" class="btn ghost" id="b-clear">Vider</button>
+          </div>
+        </div>
+        <div id="slots" class="slots"></div>
+        <p class="muted small">Clique une case pour choisir un Covert, son usure ou un float exact, et éventuellement imposer ton prix (item déjà possédé, autre site).</p>
+      </div>
+      <div id="b-result"></div>
+    </section>
 
-    <section class="card notes">
+    <!-- ============================================================ gold vise -->
+    <section id="tab-target" class="tab" role="tabpanel" hidden>
+      <div class="panel">
+        <div class="target-pick">
+          <label class="grow">Gold visé
+            <input id="target" list="golds" placeholder="ex. ★ Butterfly Knife | Doppler" autocomplete="off" spellcheck="false">
+            <datalist id="golds"></datalist>
+          </label>
+          <label>Usure minimale <select id="wear"></select></label>
+        </div>
+        <div id="examples" class="chips"></div>
+      </div>
+      <div id="t-result"></div>
+    </section>
+
+    <!-- ============================================================ meilleurs -->
+    <section id="tab-best" class="tab" role="tabpanel" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Contrat le plus rentable de chaque caisse</h2>
+          <div class="btns">
+            <label>Trier par
+              <select id="best-sort">
+                <option value="profit">Profit moyen (€)</option>
+                <option value="roi">Rentabilité (%)</option>
+                <option value="pWin">Chance de profit</option>
+              </select>
+            </label>
+            <label>Budget max <span class="inline"><input id="best-budget" type="number" min="0" step="10" placeholder="aucun" inputmode="decimal"> €</span></label>
+          </div>
+        </div>
+        <p class="muted small">Pour chaque caisse, les 5 inputs qui maximisent le profit moyen (revente des résultats moins le coût), au pire float de chaque usure achetée. Mélanger des caisses reste possible dans le constructeur.</p>
+      </div>
+      <div id="best-list" class="best-list"></div>
+    </section>
+
+    <!-- ============================================================ tradeit -->
+    <section id="tab-tradeit" class="tab" role="tabpanel" hidden>
+      <div id="ti-root"></div>
+    </section>
+
+    <section class="panel notes">
       <h2>Règles et hypothèses</h2>
       <ul>
-        <li><b>Contrat Covert → gold</b> (mise à jour du 23 octobre 2025) : 5 Coverts, tous StatTrak™ ou tous normaux, donnent un couteau ou des gants des caisses dont ils viennent. Chaque input pèse 1/5 : 3 inputs Spectrum 2 = 60 % de chances que le gold sorte du pool Spectrum 2. Un contrat StatTrak™ ne donne que des couteaux.</li>
-        <li><b>Dans le pool</b>, chaque finition est supposée avoir la même chance. Valve ne publie pas ces taux : c'est l'hypothèse des calculateurs communautaires. Pour les Doppler, les sources ne s'accordent pas sur le poids des phases : l'option avancée « chaque phase = une chance » montre l'autre lecture, et change beaucoup le résultat pour un Doppler.</li>
-        <li><b>Float de sortie</b> = min + moyenne des positions des inputs × (max − min) du gold obtenu. L'optimiseur prend le pire float possible de chaque palier d'usure acheté, donc l'usure annoncée est garantie.</li>
-        <li><b>Coût moyen pour avoir la cible</b> = (prix du contrat − revente moyenne des autres golds) ÷ chance de la cible. C'est une moyenne : un contrat peut te donner la cible du premier coup, ou pas avant des dizaines d'essais.</li>
-        <li><b>Prix</b> = annonce la moins chère parmi les sites cochés, relevée toutes les 30 minutes. Les inputs sont achetés au prix le plus bas, la revente se fait au prix le plus bas moins tes frais. Seule la phase la moins chère d'un Doppler est cotée.</li>
-        <li><b>Euros</b> : Skinport cote en € ; CSFloat, DMarket et Steam cotent en $, convertis au taux de référence BCE du jour (affiché en haut). Sur ces sites, le prix affiché en $ peut donc différer légèrement de l'équivalent en € de ta banque. Un prix de plus de 12 h n'est jamais repris : sans prix actuel, l'item est marqué « pas en vente ».</li>
-        <li><b>Ouvrir des caisses</b> n'est pas un trade-up : c'est la troisième façon d'obtenir un gold, montrée seulement pour comparaison.</li>
-        <li>Les golds reçus sont bloqués 7 jours. Les prix bougent vite depuis cette mise à jour : vérifie chaque prix sur le site avant d'acheter.</li>
+        <li><b>Contrat Covert → gold</b> (mise à jour du 23 octobre 2025) : 5 Coverts, tous StatTrak™ ou tous normaux, donnent un couteau ou des gants des caisses dont ils viennent. Chaque input pèse 1/5. Un contrat StatTrak™ ne donne que des couteaux.</li>
+        <li><b>Dans un pool</b>, chaque finition est supposée avoir la même chance (Valve ne publie pas ces taux). Pour les Doppler, l'option « chaque phase = une chance » montre l'autre lecture.</li>
+        <li><b>Float de sortie</b> = min + moyenne des positions des inputs × (max − min) du gold. Sans float exact, c'est le pire float de l'usure choisie : l'usure annoncée est garantie.</li>
+        <li><b>Valeur d'un résultat</b> = prix le plus bas actuel parmi son usure et les usures meilleures, moins tes frais de revente. Seule la phase la moins chère d'un Doppler est cotée.</li>
+        <li><b>Euros</b> : Skinport cote en € ; CSFloat, DMarket et Steam en $, convertis au taux BCE du jour. Un prix de plus de 12 h n'est jamais repris.</li>
+        <li>Une moyenne n'est pas une promesse : un contrat rentable en moyenne peut perdre, et inversement. Les golds reçus sont bloqués 7 jours.</li>
       </ul>
     </section>
   </main>
 
+  <dialog id="picker" aria-labelledby="pk-title">
+    <div class="pk">
+      <div class="pk-head">
+        <h2 id="pk-title">Choisir un Covert</h2>
+        <button type="button" class="icon-btn" id="pk-close" aria-label="Fermer">×</button>
+      </div>
+      <div class="pk-filters">
+        <input id="pk-q" type="search" placeholder="Rechercher : AK-47, Empress, Spectrum…" autocomplete="off">
+        <select id="pk-case"><option value="">Toutes les caisses</option></select>
+      </div>
+      <div class="pk-body">
+        <div id="pk-list" class="pk-list"></div>
+        <div id="pk-detail" class="pk-detail"><p class="muted">Choisis un Covert à gauche.</p></div>
+      </div>
+    </div>
+  </dialog>
+
   <footer class="wrap muted small">
     Données de jeu : <a href="https://github.com/ByMykel/CSGO-API" rel="noopener">ByMykel/CSGO-API</a>.
-    Prix : Skinport, CSFloat, DMarket, Steam Market. Outil indépendant, non affilié à Valve.
+    Prix : Skinport, CSFloat, DMarket, Steam Market. Outil indépendant, non affilié à Valve ni aux marchés cités.
   </footer>
 
   <script src="engine.js"></script>
+  <script src="vault.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

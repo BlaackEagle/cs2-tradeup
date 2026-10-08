@@ -261,4 +261,109 @@ test("donnees reelles : tous les golds s'analysent sans erreur", () => {
   console.log(`      ${n} analyses, la plus lente ${worst} ms, ${slow} au-dessus de 300 ms`);
 });
 
+// ------------------------------------------------- contrat compose a la main
+test("evaluate : calcul a la main, floats exacts", () => {
+  // 5x AK | A a 0.20 (plage 0-1) -> x = 0.20, palier FT (150 $ piece) = 750 $
+  // Doppler 0-0.08 -> 0.016 FN (1000 $) ; Rust 0.4-1 -> 0.52 BS (revente 120 $)
+  // 1 chance sur 2 chacun : EV = 560 $, profit -190 $, ROI -25.3 %, gain 50 %
+  const m = E.create(toy, prices, { fee: 0 });
+  const r = m.evaluate(Array(5).fill({ name: "AK | A", float: 0.2 }));
+  assert.ok(r.complete && !r.errors.length, r.errors.join(" "));
+  assert.strictEqual(r.cost, 750);
+  const d = r.outcomes.find((o) => o.name === "★ K | Doppler");
+  const ru = r.outcomes.find((o) => o.name === "★ K | Rust");
+  near(d.p, 0.5); near(ru.p, 0.5);
+  assert.strictEqual(d.wear, "Factory New"); near(d.float, 0.016, 1e-12);
+  assert.strictEqual(ru.wear, "Battle-Scarred"); near(ru.float, 0.52, 1e-12);
+  near(r.ev, 560, 1e-9); near(r.profit, -190, 1e-9); near(r.roi, 560 / 750 - 1, 1e-12);
+  near(r.pWin, 0.5, 1e-12);
+  assert.strictEqual(r.best.name, "★ K | Doppler");
+});
+
+test("evaluate : contrat mixte, prix impose, frais de revente", () => {
+  // 3 inputs Caisse 1 + 2 inputs Caisse 2 : Doppler = 0.6*1/2 + 0.4*1/3
+  const m = E.create(toy, prices, { fee: 10 });
+  const r = m.evaluate([
+    { name: "AK | A", wear: "Battle-Scarred" }, { name: "AK | A", wear: "Battle-Scarred" },
+    { name: "P2 | B", wear: "Well-Worn", price: 50 },
+    { name: "M4 | C", wear: "Battle-Scarred" }, { name: "M4 | C", wear: "Battle-Scarred" },
+  ]);
+  assert.strictEqual(r.cost, 100 + 100 + 50 + 80 + 80);
+  near(r.outcomes.find((o) => o.name === "★ K | Doppler").p, 0.6 / 2 + 0.4 / 3, 1e-12);
+  near(r.outcomes.find((o) => o.name === "★ G | Vice").p, 0.4 / 3, 1e-12);
+  const tot = r.outcomes.reduce((s, o) => s + o.p, 0);
+  near(tot, 1, 1e-12);
+  for (const o of r.outcomes) if (o.net != null) near(o.net, o.value * 0.9, 1e-9);
+});
+
+test("evaluate : incomplet, StatTrak impossible", () => {
+  const m = E.create(toy, prices, { fee: 0 });
+  const part = m.evaluate([{ name: "AK | A", wear: "Field-Tested" }]);
+  assert.ok(!part.complete && part.ev == null && part.outcomes.length === 2);
+  const glovesOnly = { ...toy, collections: [{ case: "Gants", hash: "Gants", inputs: ["M4 | C"], pool: [["★ G | Vice", 1]] }] };
+  const st = E.create(glovesOnly, prices, { fee: 0 }).evaluate(Array(5).fill({ name: "M4 | C", wear: "Battle-Scarred" }), { st: true });
+  assert.ok(st.errors.some((e) => /gants/.test(e)), "erreur gants en StatTrak");
+  assert.ok(st.ev == null);
+});
+
+// Reference : meilleur profit d'une caisse par enumeration complete, sans elagage
+function refBestProfit(cat, pr, ci, st, fee) {
+  const col = cat.collections[ci];
+  const sub = { ...cat, collections: [col] };
+  const m = E.create(sub, pr, { fee });
+  const cands = [];
+  for (const name of col.inputs) {
+    const sk = cat.coverts[name];
+    if (st && !sk.st) continue;
+    for (const w of sk.wears) if (m.quote(E.hashName(name, w, st))) cands.push({ name, wear: w });
+  }
+  let best = -Infinity;
+  const n = cands.length;
+  for (let a = 0; a < n; a++) for (let b = a; b < n; b++) for (let c = b; c < n; c++)
+    for (let d = c; d < n; d++) for (let e = d; e < n; e++) {
+      const r = m.evaluate([a, b, c, d, e].map((i) => cands[i]), { st });
+      if (r.profit != null && r.profit > best) best = r.profit;
+    }
+  return best;
+}
+
+test("meilleurs contrats = enumeration complete (jouet)", () => {
+  const m = E.create(toy, prices, { fee: 2 });
+  for (const r of m.bestContracts({})) {
+    const ci = toy.collections.findIndex((c) => c.case === r.case);
+    near(r.profit, refBestProfit(toy, prices, ci, false, 2), 1e-9, r.case);
+  }
+});
+
+test("donnees reelles : meilleurs contrats = enumeration complete", () => {
+  const dir = path.join(__dirname, "..", "site", "data");
+  const cat = JSON.parse(fs.readFileSync(path.join(dir, "catalog.json")));
+  const pr = JSON.parse(fs.readFileSync(path.join(dir, "prices.json")));
+  let checked = 0;
+  for (const st of [false, true]) {
+    const list = E.create(cat, pr, { fee: 2 }).bestContracts({ st });
+    for (const r of list.slice(0, 8)) {
+      const ci = cat.collections.findIndex((c) => c.case === r.case);
+      near(r.profit, refBestProfit(cat, pr, ci, st, 2), 1e-6 * Math.max(1, Math.abs(r.profit)), `${r.case} st=${st}`);
+      near(r.ev - r.cost, r.profit, 1e-9, "profit = EV - cout");
+      checked++;
+    }
+  }
+  console.log(`      ${checked} meilleurs contrats verifies contre l'enumeration complete`);
+});
+
+test("donnees reelles : evaluate = optimiseur sur le contrat retenu", () => {
+  const dir = path.join(__dirname, "..", "site", "data");
+  const cat = JSON.parse(fs.readFileSync(path.join(dir, "catalog.json")));
+  const pr = JSON.parse(fs.readFileSync(path.join(dir, "prices.json")));
+  const m = E.create(cat, pr, { fee: 2 });
+  const tu = m.analyze("★ Butterfly Knife | Doppler", {}).methods.find((x) => x.optimal);
+  const inputs = [];
+  for (const k of tu.inputs) for (let i = 0; i < k.n; i++) inputs.push({ name: k.name, wear: k.wear });
+  const r = m.evaluate(inputs);
+  near(r.cost, tu.cost, 1e-9, "cout");
+  near(r.ev, tu.ev, 1e-9, "valeur attendue");
+  near(r.outcomes.find((o) => o.name === "★ Butterfly Knife | Doppler").p, tu.p, 1e-12, "chance de la cible");
+});
+
 console.log(`\n${passed} tests passes`);

@@ -37,6 +37,10 @@
     const phaseMode = opts.phaseMode || "merged";        // "merged" | "entries"
     const floatMode = opts.floatMode || "normalized";    // "normalized" | "raw"
     const keyPrice = opts.keyPrice == null ? KEY_USD : opts.keyPrice;  // devise des prix
+    // Prix d'achat des inputs (Coverts). Par defaut le marche ; une fonction
+    // hash -> { price, src } permet de les payer autrement (echange tradeit).
+    // La valeur des resultats reste toujours celle du marche.
+    const inputQuote = typeof opts.inputQuote === "function" ? opts.inputQuote : null;
 
     function wearOf(f) {
       for (const [n, , hi] of wears) if (f < hi) return n;
@@ -202,32 +206,38 @@
     }
 
     // ------------------------------------------------------------ trade-up
+    /**
+     * Inputs achetables d'une caisse (un par Covert et par usure cotee), au
+     * pire float de leur palier. Un input plus cher ET au pire float qu'un
+     * autre de la meme caisse ne sert jamais : la valeur de revente (plafonnee,
+     * cf. resale) ne monte pas quand le float monte, et les chances ne
+     * dependent que de la caisse. Cet elagage est donc exact.
+     */
+    function candidatesFor(col, st) {
+      const cands = [];
+      for (const name of col.inputs) {
+        const sk = catalog.coverts[name];
+        if (st && !sk.st) continue;
+        for (const w of sk.wears) {
+          const hash = hashName(name, w, st);
+          const q = inputQuote ? inputQuote(hash) : quote(hash);
+          if (!q) continue;
+          const [xlo, xhi] = xBounds(sk, w);
+          cands.push({ name, wear: w, hash, q, price: q.price, xlo, xhi, float: Math.min(sk.max, wears[wearIdx[w]][2]) });
+        }
+      }
+      return cands.filter((a) => !cands.some((b) =>
+        b !== a && b.price <= a.price && b.xhi <= a.xhi && (b.price < a.price || b.xhi < a.xhi)));
+    }
+
     function prepare(target, st) {
       const cols = [];
       for (const col of catalog.collections) {
         const pool = poolOf(col, st);
         const t = pool.find((o) => o.name === target);
         if (!t) continue;
-        const cands = [];
-        for (const name of col.inputs) {
-          const sk = catalog.coverts[name];
-          if (st && !sk.st) continue;
-          for (const w of sk.wears) {
-            const hash = hashName(name, w, st);
-            const q = quote(hash);
-            if (!q) continue;
-            const [xlo, xhi] = xBounds(sk, w);
-            cands.push({ name, wear: w, hash, q, price: q.price, xlo, xhi, float: Math.min(sk.max, wears[wearIdx[w]][2]) });
-          }
-        }
-        // Un input plus cher ET au pire float qu'un autre de la meme caisse ne
-        // sert jamais : la valeur de revente (plafonnee, cf. resale) ne monte
-        // pas quand le float monte, et la chance de la cible ne depend que de
-        // la caisse. L'elagage est donc exact.
-        const front = cands.filter((a) => !cands.some((b) =>
-          b !== a && b.price <= a.price && b.xhi <= a.xhi && (b.price < a.price || b.xhi < a.xhi)));
+        const front = candidatesFor(col, st);
         if (!front.length) continue;
-
         cols.push({ col, pool, wT: t.w, cands: front, others: othersCurve(pool, target, st) });
       }
       return cols;
@@ -344,6 +354,146 @@
       };
     }
 
+    // ------------------------------------------- contrat compose a la main
+    const colOf = {};
+    for (const col of catalog.collections) for (const n of col.inputs) colOf[n] = col;
+
+    /**
+     * Evalue un contrat donne. inputs : [{ name, wear?, float?, price? }]
+     *  - float exact connu : position exacte ; sinon pire float du palier
+     *    (borne jamais atteinte, evaluee juste en dessous) ;
+     *  - price impose (inventaire, autre site), sinon meilleur prix des sources.
+     * Les chiffres de rentabilite ne sont calcules que pour 5 inputs cotes.
+     */
+    function evaluate(inputs, o) {
+      o = o || {};
+      const st = !!o.st;
+      const errors = [];
+      const rows = inputs.map((it) => {
+        const sk = catalog.coverts[it.name];
+        const col = colOf[it.name];
+        if (!sk || !col) { errors.push(`Covert inconnu : ${it.name}`); return null; }
+        if (st && !sk.st) errors.push(`${it.name} n'existe pas en StatTrak™`);
+        let wear = it.wear, float = it.float, x, exact = false;
+        if (float != null && float !== "" && isFinite(float)) {
+          float = Math.min(Math.max(+float, sk.min), sk.max);
+          wear = wearOf(Math.min(float, sk.max - 1e-9));
+          x = floatMode === "raw" ? float : (float - sk.min) / (sk.max - sk.min);
+          exact = true;
+        } else {
+          if (!wear || !sk.wears.includes(wear)) wear = sk.wears[sk.wears.length - 1];
+          x = xBounds(sk, wear)[1];
+          float = Math.min(sk.max, wears[wearIdx[wear]][2]);
+        }
+        const hash = hashName(it.name, wear, st);
+        const manual = it.price != null && it.price !== "" && isFinite(it.price);
+        const q = manual ? { price: +it.price, src: "manual", stale: false }
+          : (inputQuote ? inputQuote(hash) : quote(hash));
+        return { name: it.name, case: col.case, col, wear, float, exact, x, hash, q,
+                 price: q ? q.price : null, img: sk.img };
+      }).filter(Boolean);
+
+      const n = rows.length;
+      const res = { st, inputs: rows, n, complete: n === SLOTS, errors, outcomes: [] };
+      if (!n) return res;
+
+      const anySup = rows.some((r) => !r.exact);
+      const x = rows.reduce((s, r) => s + r.x, 0) / n - (anySup ? EPS : 0);
+      res.x = x;
+
+      // chaque input pese 1/n de la probabilite (1/5 pour un contrat complet)
+      const byCase = new Map();
+      for (const r of rows) byCase.set(r.col, (byCase.get(r.col) || 0) + 1);
+      const acc = new Map();
+      for (const [col, k] of byCase) {
+        const pool = poolOf(col, st);
+        if (!pool.length) {
+          errors.push(`${col.case} ne contient que des gants : pas de contrat StatTrak™ possible`);
+          continue;
+        }
+        for (const p of pool) {
+          const cur = acc.get(p.name) || { name: p.name, p: 0, cases: [] };
+          cur.p += (k / n) * p.w;
+          if (!cur.cases.includes(col.case)) cur.cases.push(col.case);
+          acc.set(p.name, cur);
+        }
+      }
+
+      const cost = rows.every((r) => r.price != null) ? rows.reduce((s, r) => s + r.price, 0) : null;
+      res.cost = cost;
+      res.outcomes = [...acc.values()].map((oc) => {
+        const at = goldAt(oc.name, x, st);
+        const net = at.value != null ? at.value * (1 - fee) : null;
+        return Object.assign(oc, at, {
+          hash: hashName(oc.name, at.wear, st),
+          img: catalog.golds[oc.name].img,
+          net,
+          profit: net != null && cost != null ? net - cost : null,
+          roi: net != null && cost ? net / cost - 1 : null,
+        });
+      }).sort((a, b) => (b.net == null) - (a.net == null) || (b.net || 0) - (a.net || 0));
+      res.unpriced = res.outcomes.filter((oc) => oc.net == null).length;
+
+      if (res.complete && cost != null && !errors.length) {
+        const ev = res.outcomes.reduce((s, oc) => s + oc.p * (oc.net || 0), 0);
+        const priced = res.outcomes.filter((oc) => oc.net != null);
+        Object.assign(res, {
+          ev,
+          profit: ev - cost,
+          roi: ev / cost - 1,
+          pWin: res.outcomes.reduce((s, oc) => s + (oc.net != null && oc.net > cost ? oc.p : 0), 0),
+          best: priced[0] || null,
+          worst: priced[priced.length - 1] || null,
+        });
+      }
+      return res;
+    }
+
+    /**
+     * Contrat le plus rentable de chaque caisse (5 inputs de la meme caisse,
+     * pire float de chaque palier achete) : profit moyen = revente attendue
+     * de tous les golds possibles - cout. Exact grace au meme elagage.
+     */
+    function bestContracts(o) {
+      o = o || {};
+      const st = !!o.st;
+      const budget = o.budget > 0 ? o.budget : Infinity;
+      const out = [];
+      for (const col of catalog.collections) {
+        const pool = poolOf(col, st);
+        if (!pool.length) continue;
+        const cands = candidatesFor(col, st).sort((a, b) => a.price - b.price);
+        if (!cands.length) continue;
+        const curve = othersCurve(pool, null, st);        // tous les golds du pool
+        const n = cands.length, pick = [];
+        let best = null;
+        (function rec(start, depth, cost, xs) {
+          if (depth === SLOTS) {
+            const profit = curveAt(curve, xs / SLOTS - EPS) - cost;
+            if (!best || profit > best.profit) best = { profit, pick: pick.slice() };
+            return;
+          }
+          const left = SLOTS - depth;
+          for (let i = start; i < n; i++) {
+            const k = cands[i];
+            const floor = cost + left * k.price;          // les suivants coutent au moins autant
+            if (floor > budget) break;
+            if (best && curve.max - floor <= best.profit) break;
+            pick.push(i);
+            rec(i, depth + 1, cost + k.price, xs + k.xhi);
+            pick.pop();
+          }
+        })(0, 0, 0, 0);
+        if (!best) continue;
+        const r = evaluate(best.pick.map((i) => ({ name: cands[i].name, wear: cands[i].wear })), { st });
+        if (r.ev == null) continue;
+        out.push(Object.assign(r, { case: col.case, caseImg: col.img }));
+      }
+      const key = o.sort || "profit";
+      out.sort((a, b) => (b[key] || 0) - (a[key] || 0));
+      return out;
+    }
+
     // ------------------------------------------------- ouverture de caisses
     function unbox(target, st, minWear, col) {
       const g = catalog.golds[target];
@@ -411,7 +561,8 @@
       };
     }
 
-    return { analyze, quote, quotesAll, hashName, wearOf, poolOf, allowedWears, goldAt };
+    return { analyze, evaluate, bestContracts, quote, quotesAll, hashName, wearOf,
+             poolOf, allowedWears, goldAt, caseOf: (name) => colOf[name] };
   }
 
   const api = { create, hashName, LIVE, KEY_USD, P_GOLD };

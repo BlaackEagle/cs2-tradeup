@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests brotli
+      - run: pip install requests brotli cryptography
 
       - name: Catalogue (caisses, Coverts, couteaux et gants)
         run: python scripts/build_catalog.py || echo "::warning::catalogue non regenere, version du depot conservee"
@@ -45,6 +45,18 @@ jobs:
         run: |
           echo "site : ${{ steps.pages.outputs.base_url }}"
           python scripts/fetch_prices.py --previous "${{ steps.pages.outputs.base_url }}/data/prices.json"
+
+      # Inventaire tradeit de l'utilisateur, chiffre avant publication. Sans les
+      # deux secrets, rien n'est publie. Le script n'ecrit ni identifiant ni montant.
+      - name: Inventaire tradeit (chiffre)
+        env:
+          STEAM_ID: ${{ secrets.STEAM_ID }}
+          INVENTORY_KEY: ${{ secrets.INVENTORY_KEY }}
+        run: |
+          base="${{ steps.pages.outputs.base_url }}"
+          # reprend le dernier fichier publie si le releve echoue
+          curl -sf -o site/data/inventory.enc.json "$base/data/inventory.enc.json" || rm -f site/data/inventory.enc.json
+          python scripts/fetch_inventory.py || echo "::warning::inventaire non releve"
 
       - uses: actions/setup-node@v4
         with:

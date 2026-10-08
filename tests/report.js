@@ -21,6 +21,16 @@ for (const k of pr.order) {
   console.log(`  ${s.label.padEnd(24)} ${s.ok ? "OK " : s.stale ? "ANC" : "KO "} ${String(s.count).padStart(5)} prix` +
               `${a != null ? `, il y a ${a} min` : ""}${s.error ? "  (" + s.error.slice(0, 60) + ")" : ""}`);
 }
+if (pr.tradeit) {
+  const t = pr.tradeit;
+  console.log(`  ${t.label.padEnd(24)} ${t.ok ? "OK " : t.stale ? "ANC" : "KO "} ${String(t.count).padStart(5)} Coverts` +
+              `${t.error ? "  (" + t.error.slice(0, 60) + ")" : ""}`);
+  // exemple : prix d'echange / prix de marche d'un Covert (attendu ~1,8)
+  const h = "AK-47 | The Empress (Field-Tested)";
+  const it = pr.items[h] || {};
+  const mk = ["sk", "cf", "dm", "st"].map((k) => it[k] && it[k][0]).filter(Boolean);
+  if (it.tt && mk.length) console.log(`    ${h} : echange ${it.tt[0].toFixed(2)} / marche ${Math.min(...mk).toFixed(2)} = x${(it.tt[0] / Math.min(...mk)).toFixed(3)}`);
+}
 
 // memes reglages que le site par defaut : sources live seulement
 const m = E.create(cat, pr, { fee: 2, keyPrice: 2.49, sources: ["sk", "cf", "dm", "st"] });
