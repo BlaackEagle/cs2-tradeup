@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Sonde temporaire n°7 : lire le stock de Coverts tradeit avec moins de requetes.
-  a) une recherche peut-elle rendre les items un par un (sans piles) ?
-  b) un filtre de rarete permet-il de lister tous les Coverts en quelques pages ?
-  c) parametres reconnus par l'appel inventory/data dans le code du site.
-Requetes espacees de 2,5 s (limite de debit de tradeit).
+Sonde temporaire n°8 : lister tous les Coverts de la boutique tradeit par le
+filtre rarity=Covert, page par page.
+  a) pagination (offset de 500 en 500 : recouvrement, trous, fin de liste)
+  b) Coverts du catalogue trouves, piles et items unitaires
+  c) filtres de type d'arme (pour ecarter couteaux et gants)
+Une requete toutes les 2,2 s ; les HTTP 429 sont comptes.
 """
 import json
 import os
-import re
 import sys
 import time
 
@@ -26,63 +26,63 @@ for n, c in cat["coverts"].items():
     for w in c["wears"]:
         COV.add(f"{n} ({w})")
         COV.add(f"StatTrak™ {n} ({w})")
+n429 = 0
 
 
-def get(params, label):
-    time.sleep(2.5)
-    r = S.get(API, params=dict({"gameId": 730}, **params), timeout=40)
-    rl = {k: v for k, v in r.headers.items() if "rate" in k.lower() or k.lower() == "retry-after"}
-    try:
-        d = r.json()
-    except ValueError:
-        print(f"  {label}: HTTP {r.status_code} non JSON {rl}")
-        return None
-    items = d.get("items") or []
-    single = sum(1 for x in items if x.get("assetId") is not None)
-    fl = sum(1 for x in items if x.get("floatValue") is not None)
-    cov = sum(1 for x in items if x.get("name") in COV)
-    print(f"  {label}: HTTP {r.status_code} {len(items)} lignes, {single} unitaires, {fl} avec float, "
-          f"{cov} Coverts du catalogue, cles={sorted(d)[:8]} {rl}")
-    return d
-
-
-print("### a) recherche sans piles ?")
-base = {"offset": 0, "limit": 500, "searchValue": "AK-47 | The Empress"}
-for extra in ({}, {"fresh": "true", "isForStore": 0}, {"isForStore": 1}, {"stack": "false"},
-              {"groupBy": "none"}, {"stacked": "false"}, {"unstack": "true"}):
-    get(dict(base, **extra), f"recherche {extra}")
-
-print("\n### b) filtre de rarete")
-for extra in ({"rarity": "Covert"}, {"rarities": "Covert"}, {"rarity[]": "Covert"}, {"type": "Covert"},
-              {"quality": "Covert"}, {"filters": json.dumps({"rarity": ["Covert"]})}):
-    d = get(dict({"offset": 0, "limit": 500}, **extra), f"boutique {extra}")
-    if d and d.get("items"):
-        names = [x.get("name") for x in d["items"][:5]]
-        print(f"     premiers : {names}")
-
-print("\n### c) code du site")
-try:
-    html = S.get("https://tradeit.gg/csgo/trade", headers={"Accept": "text/html"}, timeout=40).text
-    js = sorted(set(re.findall(r'(?:src|href)="(/_nuxt/[^"]+\.js)"', html)))
-    print(f"  {len(js)} fichiers JS")
-    seen = set()
-    for path in js:
-        time.sleep(0.5)
-        try:
-            src = S.get("https://tradeit.gg" + path, timeout=40).text
-        except requests.RequestException:
+def get(params):
+    global n429
+    for _ in range(4):
+        time.sleep(2.2)
+        r = S.get(API, params=dict({"gameId": 730}, **params), timeout=40)
+        if r.status_code == 429:
+            n429 += 1
+            time.sleep(20)
             continue
-        for m in re.finditer(r"inventory/data", src):
-            ctx = src[max(0, m.start() - 700): m.end() + 900]
-            key = ctx[:120]
-            if key in seen:
-                continue
-            seen.add(key)
-            print(f"  --- {path} ---\n  {ctx}\n")
-        for word in ("rarity", "exterior", "minFloat", "floatMin", "maxFloat", "isForStore", "fresh"):
-            k = len(re.findall(word, src))
-            if k:
-                print(f"  {path}: '{word}' x{k}")
-except requests.RequestException as e:
-    print(f"  code illisible : {e}")
+        return r.json()
+    return {}
+
+
+print("### a/b) rarity=Covert, pages de 500")
+t0 = time.time()
+seen, pages, cov_lines, cov_groups, singles = {}, 0, 0, set(), 0
+knife = glove = other = 0
+prev_last = None
+for page in range(40):
+    d = get({"rarity": "Covert", "offset": page * 500, "limit": 500})
+    items = d.get("items") or []
+    pages += 1
+    ids = [x.get("groupId") if x.get("assetId") is None else ("a", x.get("assetId")) for x in items]
+    dup = sum(1 for i in ids if i in seen)
+    for i, x in zip(ids, items):
+        seen.setdefault(i, page)
+        nm = x.get("name") or ""
+        if nm in COV:
+            cov_lines += 1
+            cov_groups.add(i)
+            singles += x.get("assetId") is not None
+        elif nm.startswith("★") and ("Gloves" in nm or "Wraps" in nm):
+            glove += 1
+        elif nm.startswith("★"):
+            knife += 1
+        else:
+            other += 1
+    prices = [x.get("priceForTrade") or x.get("price") or 0 for x in items]
+    print(f"  page {page}: {len(items)} lignes, {dup} deja vues, prix {max(prices) if prices else '-'} -> "
+          f"{min(prices) if prices else '-'}, premier {items[0].get('name') if items else '-'}")
+    if len(items) < 400:
+        break
+print(f"  total : {pages} pages en {time.time() - t0:.0f}s, {len(seen)} lignes distinctes, "
+      f"{len(cov_groups)} lignes de Coverts du catalogue ({singles} unitaires), "
+      f"couteaux {knife}, gants {glove}, autres Coverts {other}, HTTP 429 : {n429}")
+
+print("\n### c) filtres de type")
+for extra in ({"type": "Rifle"}, {"type": "rifle"}, {"type": "Pistol"}, {"category": "Rifle"},
+              {"weapon": "AK-47"}, {"types": "Rifle"}, {"exterior": "Factory New"}):
+    d = get(dict({"rarity": "Covert", "offset": 0, "limit": 500}, **extra))
+    items = d.get("items") or []
+    cov = sum(1 for x in items if x.get("name") in COV)
+    kn = sum(1 for x in items if (x.get("name") or "").startswith("★"))
+    print(f"  {extra}: {len(items)} lignes, {cov} Coverts du catalogue, {kn} couteaux/gants, "
+          f"exemples {[x.get('name') for x in items[:3]]}")
+print(f"\nHTTP 429 au total : {n429}")
 sys.exit(0)
