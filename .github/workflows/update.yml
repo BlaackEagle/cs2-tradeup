@@ -35,13 +35,16 @@ jobs:
       - name: Catalogue (caisses, Coverts, couteaux et gants)
         run: python scripts/build_catalog.py || echo "::warning::catalogue non regenere, version du depot conservee"
 
+      # adresse reelle du site (domaine personnalise s'il y en a un)
+      - id: pages
+        uses: actions/configure-pages@v5
+
       - name: Prix
         env:
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
         run: |
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          python scripts/fetch_prices.py --previous "https://${owner}.github.io/${repo}/data/prices.json"
+          echo "site : ${{ steps.pages.outputs.base_url }}"
+          python scripts/fetch_prices.py --previous "${{ steps.pages.outputs.base_url }}/data/prices.json"
 
       - uses: actions/setup-node@v4
         with:
@@ -71,8 +74,6 @@ jobs:
           path: ${{ runner.temp }}/captures
           retention-days: 7
           if-no-files-found: ignore
-
-      - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
         with:
