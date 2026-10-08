@@ -30,6 +30,10 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   await p.evaluate(() => localStorage.clear());
   await p.reload({ waitUntil: "networkidle" });
   await p.waitForSelector("#slots .slot");
+  const tiModeOk = await p.$eval('#mode [value="tradeit"]', (o) => !o.disabled);
+  check("prix tradeit par defaut quand le stock est releve", !tiModeOk || (await p.$eval("#mode", (e) => e.value)) === "tradeit");
+  await p.selectOption("#mode", "market");             // d'abord la logique des marches
+  await p.waitForTimeout(150);
 
   // ------------------------------------------------------------ constructeur
   check("onglet Constructeur par defaut", (await p.getAttribute('.tabs [data-tab="builder"]', "aria-selected")) === "true");
@@ -134,7 +138,8 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   if (hasStock) {
     const cards = await p.$$eval("#ti-root .ti-c", (x) => x.map((c) => c.querySelectorAll(".ti-it").length));
     check("contrats du stock : 5 items precis chacun", cards.length >= 5 && cards.every((n) => n === 5), `${cards.length} contrats`);
-    if (!pass) check("sans inventaire : taux estime annonce", /taux estimé/.test(tiText));
+    check("tout en monnaie d'echange tradeit", /monnaie d'échange tradeit/.test(tiText));
+    check("aucune comparaison aux autres sites", !/Skinport|CSFloat|DMarket|au marché|tu cèdes/i.test(tiText), tiText.match(/Skinport|CSFloat|DMarket|au marché|tu cèdes/i));
     const profits = await p.$$eval("#ti-root .ti-c .side b", (x) => x.map((e) => e.innerText));
     check("contrats du stock tries par profit", profits.map(money).every((v, i, a) => i === 0 || v <= a[i - 1] + 1e-9), profits.slice(0, 3).join(" "));
     await p.click("#ti-root [data-tioc]");
@@ -158,7 +163,7 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     await p.fill("#ti-pass", pass);
     await p.click('#ti-unlock button[type="submit"]');
     await p.waitForSelector("#ti-root .kpi", { timeout: 10000 });
-    if (hasStock) check("inventaire deverrouille : ton taux", /ton taux/.test(await text(p, "#ti-root")));
+    check("inventaire deverrouille : solde d'echange", /Ton solde d'échange/.test(await text(p, "#ti-root")));
     await p.click('#ti-root [data-tiview="inv"]');
     await p.waitForSelector("#ti-root table", { timeout: 10000 });
     const rows = await p.$$eval("#ti-root tbody tr", (x) => x.length);
@@ -167,12 +172,17 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     await p.click("#ti-root tbody tr:first-child input[type=checkbox]");
     await p.waitForTimeout(200);
     check("decocher un item change la valeur d'echange", before !== (await text(p, "#ti-root .kpi:first-child b")));
-    check("comparaison marche / echange", /Voie marché/.test(await text(p, "#ti-root")) && /Voie échange tradeit/.test(await text(p, "#ti-root")));
+    const invTxt = await text(p, "#ti-root");
+    check("contrat du constructeur en echange", /Ton contrat du constructeur, en échange|pas en stock chez tradeit/.test(invTxt));
+    check("inventaire sans prix des autres sites", !/Marché|Skinport|CSFloat|DMarket/.test(invTxt));
     await p.screenshot({ path: path.join(out, "tradeit.png"), fullPage: true });
-    await p.click('#ti-root [data-pay="tradeit"]');
-    await p.click('.tabs [data-tab="builder"]');
-    await p.waitForTimeout(200);
-    check("inputs payes en echange tradeit", (await p.$$eval("#slots .src.ti", (x) => x.length)) === 5);
+    if (hasStock) {
+      await p.selectOption("#mode", "tradeit");
+      await p.click('.tabs [data-tab="builder"]');
+      await p.waitForTimeout(200);
+      check("prix tradeit dans le constructeur", (await p.$$eval("#slots .src.ti", (x) => x.length)) === 5);
+      check("valeur en echange dans le constructeur", /ce que tradeit t'en donne/.test(await text(p, "#b-result")));
+    }
     await p.reload({ waitUntil: "networkidle" });
     await p.click('.tabs [data-tab="tradeit"]');
     await p.waitForSelector("#ti-root table", { timeout: 10000 });
@@ -190,12 +200,12 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     if (await p.$("#ti-budget")) {
       // inventaire deverrouille : par defaut, seulement les contrats dans le solde
       const bal = money(await text(p, "#ti-root .kpi:first-child b"));
-      const trades = await p.$$eval("#ti-root .ti-c .meta-row span:first-child b", (x) => x.map((e) => e.innerText));
+      const trades = await p.$$eval("#ti-root .ti-c .meta-row span:first-child b", (x) => x.map((e) => e.innerText));   // cout en echange
       check("dans mon solde : contrats financables", trades.map(money).every((v) => v <= bal + 0.01), `${trades.length} contrats, solde ${bal}`);
       if (await p.isChecked("#ti-budget")) { await p.uncheck("#ti-budget"); await p.waitForTimeout(300); }
     }
     await p.waitForSelector("#ti-root .ti-c");
-    const cede = await text(p, "#ti-root .ti-c .meta-row span:nth-child(2) b");
+    const cede = await text(p, "#ti-root .ti-c .meta-row span:first-child b");
     const fl = await p.$$eval("#ti-root .ti-c:first-of-type .ti-it small:first-of-type", (x) => x.map((e) => e.innerText.split("· ")[1]));
     await p.click("#ti-root .ti-c [data-tiload]");
     await p.waitForSelector("#slots .slot.filled");
@@ -204,7 +214,7 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     const slotsTxt = await text(p, "#slots");
     check("floats exacts du stock repris", fl.length === 5 && fl.every((f) => slotsTxt.includes(f)), fl.join(" "));
     const kc = await text(p, ".kpi:first-child b");
-    check("cout du constructeur = ce que tu cedes", Math.abs(money(kc) - money(cede)) < 0.011, `${kc} vs ${cede}`);
+    check("cout du constructeur = cout en echange du contrat", Math.abs(money(kc) - money(cede)) < 0.011, `${kc} vs ${cede}`);
 
     // Coverts en stock : tableau, filtre, ajout au constructeur
     await p.click("#b-clear");
@@ -213,6 +223,8 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     await p.waitForSelector("#ti-stock-table tbody tr");
     const nrows = await p.$$eval("#ti-stock-table tbody tr", (x) => x.length);
     check("Coverts en stock : tableau", nrows > 10, `${nrows} lignes`);
+    const heads = await text(p, "#ti-stock-table thead");
+    check("Coverts en stock : prix d'echange, sans colonne marche", /Prix d'échange/.test(heads) && !/Marché|Écart|cèdes/.test(heads), heads);
     await p.fill("#ti-q", "Empress");
     await p.waitForTimeout(150);
     const names = await p.$$eval("#ti-stock-table tbody td:nth-child(2) b", (x) => x.map((e) => e.innerText));

@@ -46,36 +46,49 @@ for (const t of targets) {
   if (best) console.log(`  -> le moins cher : ${best.label}, ${money(best.expected)}`);
 }
 
-// Stock tradeit (donnees publiques de la boutique) : meilleurs contrats au taux
-// estime du site, comme les voit un visiteur sans inventaire deverrouille.
+// Stock tradeit (donnees publiques de la boutique) : meilleurs contrats en
+// monnaie d'echange, comme sur le site : Coverts a leur prix d'echange, golds
+// a ce que tradeit en donne (estime quand tradeit n'en a pas en stock).
 const tf = path.join(dir, "tradeit.json");
 if (fs.existsSync(tf)) {
   const t = JSON.parse(fs.readFileSync(tf));
   const usd = (pr.fx && pr.fx.USD_EUR) || 0.86;
-  const listings = {}, ratios = [];
+  const conv = (c) => (c / 100) * (pr.currency === "EUR" ? usd : 1);
+  const listings = {}, cheapest = {};
   let n = 0;
   for (const [h, offers] of Object.entries(t.items || {})) {
-    listings[h] = offers.flatMap((o) => o.f.map((f) => [f, (o.p / 100) * usd]));
+    listings[h] = offers.flatMap((o) => (o.f || []).map((f) => [f, conv(o.p)]));
+    if (offers.length) cheapest[h] = conv(Math.min(...offers.map((o) => o.p)));
     n += offers.reduce((s, o) => s + o.n, 0);
-    const q = m.quote(h);
-    if (q && q.price >= 1 && offers.length) ratios.push(Math.min(...offers.map((o) => o.p)) / 100 * usd / q.price);
   }
-  ratios.sort((a, b) => a - b);
-  const med = ratios[ratios.length >> 1];
-  const rate = 1 / (0.92 * med);
+  const golds = Object.fromEntries(Object.entries(t.golds || {}).map(([h, g]) => [h, { p: conv(g.p), u: g.u ? conv(g.u) : null }]));
+  const med = (a) => { a = a.slice().sort((x, y) => x - y); return a.length ? a[a.length >> 1] : null; };
+  const share = med(Object.values(golds).filter((g) => g.u).map((g) => g.u / g.p));
+  const k = med(Object.entries(golds).map(([h, g]) => { const q = m.quote(h); const u = g.u || (share && g.p * share);
+    return q && q.price >= 5 && u ? u / q.price : null; }).filter(Boolean));
+  const buy = (h) => (cheapest[h] ? { price: cheapest[h], src: "ti" } : golds[h] ? { price: golds[h].p, src: "ti" } : null);
+  const value = (h) => {
+    const g = golds[h];
+    if (g && g.u) return { price: g.u, src: "ti" };
+    if (g && share) return { price: g.p * share, src: "ti", est: true };
+    const q = k ? m.quote(h) : null;
+    return q ? { price: q.price * k, src: "ti", est: true } : null;
+  };
+  const ti = E.create(cat, pr, { fee: 0, quote: buy, valueQuote: value });
   const st = t.stats || {};
   console.log(`\n=== stock tradeit : ${n} items, ${Object.keys(t.items || {}).length} skins et usures, ` +
               `releve il y a ${ageMin(t.updated_at)} min ; floats lus pour ${st.with_floats}/${st.offers} piles, ` +
               `${st.requests} requetes dont ${st.http429} refusees (429) ===`);
-  if (ratios.length < 10) console.log("  pas assez de prix de marche pour estimer le taux d'echange");
-  else console.log(`  echange / marche median x${med.toFixed(3)} sur ${ratios.length} Coverts -> taux estime ${rate.toFixed(3)}`);
-  for (const st of ratios.length < 10 ? [] : [false, true]) {
+  console.log(`  couteaux et gants : ${Object.keys(golds).length} avec un prix d'echange, ${st.golds_user} avec leur valeur d'echange ` +
+              `(valeur / prix d'echange median ${share ? share.toFixed(3) : "-"}, valeur / marche median ${k ? k.toFixed(3) : "-"})`);
+  for (const stt of [false, true]) {
     const t0 = Date.now();
-    const list = m.stockContracts({ listings, rate, st, fillers: 2 });
-    console.log(`  ${st ? "StatTrak" : "normal"} : ${list.filter((r) => r.profit > 0).length}/${list.length} caisses rentables en moyenne (${Date.now() - t0} ms)`);
+    const list = ti.stockContracts({ listings, st: stt, fillers: 2 });
+    console.log(`  ${stt ? "StatTrak" : "normal"} : ${list.filter((r) => r.profit > 0).length}/${list.length} caisses rentables en moyenne, en monnaie d'echange (${Date.now() - t0} ms)`);
     for (const r of list.slice(0, 3)) {
+      const est = r.outcomes.filter((o) => o.est).length;
       console.log(`    ${r.case}${r.fillers ? ` + ${r.fillers} complement(s)` : ""} : profit ${money(r.profit)} (${(r.roi * 100).toFixed(1)} %), ` +
-                  `cede ${money(r.cost)}, chance ${(r.pWin * 100).toFixed(1)} %`);
+                  `cout ${money(r.cost)}, chance ${(r.pWin * 100).toFixed(1)} %${est ? `, ${est}/${r.outcomes.length} resultats estimes` : ""}`);
       console.log(`       ${r.inputs.map((x) => `${x.hash} ${x.float.toFixed(4)}`).join(" + ")}`);
     }
   }

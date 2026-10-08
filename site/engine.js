@@ -38,9 +38,14 @@
     const floatMode = opts.floatMode || "normalized";    // "normalized" | "raw"
     const keyPrice = opts.keyPrice == null ? KEY_USD : opts.keyPrice;  // devise des prix
     // Prix d'achat des inputs (Coverts). Par defaut le marche ; une fonction
-    // hash -> { price, src } permet de les payer autrement (echange tradeit).
-    // La valeur des resultats reste toujours celle du marche.
+    // hash -> { price, src } permet de les payer autrement.
     const inputQuote = typeof opts.inputQuote === "function" ? opts.inputQuote : null;
+    // Autre jeu de prix complet, hash -> { price, src } ou null :
+    //   quote      : prix d'achat (inputs, achat direct d'un gold) a la place des marches ;
+    //   valueQuote : valeur d'un gold obtenu (ex. ce que tradeit en donne en echange).
+    // Sans valueQuote, un gold vaut son prix d'achat le plus bas.
+    const customQuote = typeof opts.quote === "function" ? opts.quote : null;
+    const customValue = typeof opts.valueQuote === "function" ? opts.valueQuote : null;
 
     function wearOf(f) {
       for (const [n, , hi] of wears) if (f < hi) return n;
@@ -54,7 +59,16 @@
       return qcache.get(hash);
     }
 
+    const valcache = new Map();
+    /** Valeur d'un gold obtenu par contrat (avant frais de revente). */
+    function valueOf(hash) {
+      if (!customValue) return quote(hash);
+      if (!valcache.has(hash)) valcache.set(hash, customValue(hash));
+      return valcache.get(hash);
+    }
+
     function quoteRaw(hash) {
+      if (customQuote) return customQuote(hash);
       const it = prices.items[hash];
       if (!it) return null;
       let best = null;
@@ -110,7 +124,7 @@
       const g = catalog.golds[name];
       let best = null, firstPriced = null;
       for (const w of g.wears) {
-        const q = quote(hashName(name, w, st));
+        const q = valueOf(hashName(name, w, st));
         if (!q) continue;
         if (!firstPriced) firstPriced = { price: q.price, wear: w };
         if (wearIdx[w] > wearIdx[wear]) break;
@@ -125,15 +139,16 @@
     function goldAt(name, x, st) {
       const g = catalog.golds[name];
       if (!g.wears.length) {
-        const q = quote(hashName(name, null, st));
-        return { wear: null, float: null, q, value: q ? q.price : null, cappedBy: null };
+        const q = valueOf(hashName(name, null, st));
+        return { wear: null, float: null, q, value: q ? q.price : null, cappedBy: null, est: !!(q && q.est) };
       }
       const f = outFloat(g, x);
       // un float egal au max du skin reste dans l'usure qui contient ce max
       const w = wearOf(Math.min(f, g.max - 1e-9));
       const v = resale(name, w, st);
-      return { wear: w, float: f, q: quote(hashName(name, w, st)),
-               value: v ? v.price : null, cappedBy: v && v.wear !== w ? v.wear : null };
+      const q = v ? valueOf(hashName(name, v.wear, st)) : null;
+      return { wear: w, float: f, q: valueOf(hashName(name, w, st)),
+               value: v ? v.price : null, cappedBy: v && v.wear !== w ? v.wear : null, est: !!(q && q.est) };
     }
 
     /**
