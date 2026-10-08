@@ -60,17 +60,49 @@ def encrypt(payload, passphrase):
             "iter": ITERATIONS, "salt": b64(salt), "iv": b64(iv), "data": b64(data)}
 
 
+class Fail(Exception):
+    pass
+
+
+def safe(text):
+    """Message d'erreur sans aucun nombre long (identifiant Steam, assetId...)."""
+    return re.sub(r"\d{6,}", "…", re.sub(r"\s+", " ", str(text)))[:200]
+
+
+def call(step, method, url, **kw):
+    """Requete tradeit avec quelques essais ; l'erreur ne dit que l'etape et le code."""
+    last = None
+    for attempt in range(4):
+        try:
+            r = requests.request(method, url, headers=HEADERS, timeout=60, **kw)
+        except requests.RequestException as e:
+            last = f"{step} : {type(e).__name__}"
+            time.sleep(5 * (attempt + 1))
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            last = f"{step} : HTTP {r.status_code}"
+            time.sleep(10 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            raise Fail(f"{step} : HTTP {r.status_code} ({safe(r.text)})")
+        try:
+            return r.json()
+        except ValueError:
+            raise Fail(f"{step} : reponse illisible ({safe(r.text)})")
+    raise Fail(last or f"{step} : echec reseau")
+
+
 def fetch(steam_id):
-    r = requests.get(API + "/inventory/search", params={"steamId": steam_id}, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    inv = (r.json().get("data") or {}).get("inventory") or []
+    d = call("lecture de l'inventaire", "GET", API + "/inventory/search", params={"steamId": steam_id})
+    if d.get("success") is False:
+        raise Fail(f"lecture de l'inventaire : refusee ({safe(d.get('message'))})")
+    inv = (d.get("data") or {}).get("inventory") or []
     groups = sorted({it["itemId"] for it in inv if it.get("itemId")})
     prices = {}
-    for i in range(0, len(groups), 200):
-        rr = requests.post(API + "/inventory/items-prices", headers=HEADERS, timeout=60,
-                           json={"context": "trade", "groupIds": groups[i:i + 200], "appId": 730})
-        rr.raise_for_status()
-        prices.update((rr.json() or {}).get("data") or {})
+    for i in range(0, len(groups), 50):
+        dd = call("valeurs d'echange", "POST", API + "/inventory/items-prices",
+                  json={"context": "trade", "groupIds": groups[i:i + 50], "appId": 730})
+        prices.update((dd or {}).get("data") or {})
         time.sleep(0.3)
 
     items = []
@@ -100,8 +132,11 @@ def main():
 
     try:
         items = fetch(steam_id)
+    except Fail as e:
+        print(f"releve impossible : {e} -- fichier precedent conserve")
+        return 0
     except Exception as e:                                   # noqa: BLE001
-        print(f"releve impossible ({type(e).__name__}) : fichier precedent conserve")
+        print(f"releve impossible ({type(e).__name__}) -- fichier precedent conserve")
         return 0
     valued = [it for it in items if it.get("user")]
     if not valued:
