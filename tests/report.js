@@ -5,7 +5,7 @@
 const path = require("path");
 const fs = require("fs");
 const E = require(path.join(__dirname, "..", "site", "engine.js"));
-const dir = path.join(__dirname, "..", "site", "data");
+const dir = process.env.DATA_DIR || path.join(__dirname, "..", "site", "data");
 const cat = JSON.parse(fs.readFileSync(path.join(dir, "catalog.json")));
 const pr = JSON.parse(fs.readFileSync(path.join(dir, "prices.json")));
 
@@ -55,4 +55,37 @@ for (const t of targets) {
   }
   const best = r.methods.filter((x) => x.kind !== "unbox")[0];
   if (best) console.log(`  -> le moins cher : ${best.label}, ${money(best.expected)}`);
+}
+
+// Stock tradeit (donnees publiques de la boutique) : meilleurs contrats au taux
+// estime du site, comme les voit un visiteur sans inventaire deverrouille.
+const tf = path.join(dir, "tradeit.json");
+if (fs.existsSync(tf)) {
+  const t = JSON.parse(fs.readFileSync(tf));
+  const usd = (pr.fx && pr.fx.USD_EUR) || 0.86;
+  const listings = {}, ratios = [];
+  let n = 0;
+  for (const [h, offers] of Object.entries(t.items || {})) {
+    listings[h] = offers.flatMap((o) => o.f.map((f) => [f, (o.p / 100) * usd]));
+    n += offers.reduce((s, o) => s + o.n, 0);
+    const q = m.quote(h);
+    if (q && q.price >= 1 && offers.length) ratios.push(Math.min(...offers.map((o) => o.p)) / 100 * usd / q.price);
+  }
+  ratios.sort((a, b) => a - b);
+  const med = ratios[ratios.length >> 1];
+  const rate = 1 / (0.92 * med);
+  console.log(`\n=== stock tradeit : ${n} items, ${Object.keys(t.items || {}).length} skins et usures, ` +
+              `releve il y a ${ageMin(t.updated_at)} min${t.complete ? "" : " (PARTIEL)"} ===`);
+  if (ratios.length < 10) console.log("  pas assez de prix de marche pour estimer le taux d'echange");
+  else console.log(`  echange / marche median x${med.toFixed(3)} sur ${ratios.length} Coverts -> taux estime ${rate.toFixed(3)}`);
+  for (const st of ratios.length < 10 ? [] : [false, true]) {
+    const t0 = Date.now();
+    const list = m.stockContracts({ listings, rate, st, fillers: 2 });
+    console.log(`  ${st ? "StatTrak" : "normal"} : ${list.filter((r) => r.profit > 0).length}/${list.length} caisses rentables en moyenne (${Date.now() - t0} ms)`);
+    for (const r of list.slice(0, 3)) {
+      console.log(`    ${r.case}${r.fillers ? ` + ${r.fillers} complement(s)` : ""} : profit ${money(r.profit)} (${(r.roi * 100).toFixed(1)} %), ` +
+                  `cede ${money(r.cost)}, chance ${(r.pWin * 100).toFixed(1)} %`);
+      console.log(`       ${r.inputs.map((x) => `${x.hash} ${x.float.toFixed(4)}`).join(" + ")}`);
+    }
+  }
 }

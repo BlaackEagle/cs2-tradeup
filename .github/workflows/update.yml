@@ -22,7 +22,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +45,14 @@ jobs:
         run: |
           echo "site : ${{ steps.pages.outputs.base_url }}"
           python scripts/fetch_prices.py --previous "${{ steps.pages.outputs.base_url }}/data/prices.json"
+
+      # Stock de la boutique d'echange tradeit, item par item (float exact, prix,
+      # piles) : donnees publiques. Si le releve echoue, le dernier stock publie
+      # est garde 12 h au plus.
+      - name: Stock tradeit (floats)
+        run: |
+          curl -sf -o site/data/tradeit.json "${{ steps.pages.outputs.base_url }}/data/tradeit.json" || rm -f site/data/tradeit.json
+          python scripts/fetch_tradeit_stock.py || echo "::warning::stock tradeit non releve"
 
       # Inventaire tradeit de l'utilisateur, chiffre avant publication. Sans les
       # deux secrets, rien n'est publie. Le script n'ecrit ni identifiant ni montant.

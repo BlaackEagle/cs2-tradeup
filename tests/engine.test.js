@@ -6,7 +6,9 @@ const fs = require("fs");
 const E = require(path.join(__dirname, "..", "site", "engine.js"));
 
 let passed = 0;
+const only = process.env.ONLY ? new RegExp(process.env.ONLY) : null;   // ONLY=stock : sous-ensemble
 function test(name, fn) {
+  if (only && !only.test(name)) return;
   try { fn(); passed++; console.log("ok  -", name); }
   catch (e) { console.log("ECHEC -", name, "\n     ", e.message); process.exitCode = 1; }
 }
@@ -364,6 +366,193 @@ test("donnees reelles : evaluate = optimiseur sur le contrat retenu", () => {
   near(r.cost, tu.cost, 1e-9, "cout");
   near(r.ev, tu.ev, 1e-9, "valeur attendue");
   near(r.outcomes.find((o) => o.name === "★ Butterfly Knife | Doppler").p, tu.p, 1e-12, "chance de la cible");
+});
+
+// ------------------------------------------------- stock reel (items precis)
+function rng(seed) {                     // mulberry32 : tirages reproductibles
+  return () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** stock aleatoire : par usure, quelques items au meme prix (une pile) ou a des prix differents */
+function randomStock(cat, rand, o) {
+  const out = {};
+  for (const name of Object.keys(cat.coverts)) {
+    const sk = cat.coverts[name];
+    for (const st of o.st ? [false, true] : [false]) {
+      if (st && !sk.st) continue;
+      for (const w of sk.wears) {
+        if (rand() < (o.skip || 0.3)) continue;
+        const [, lo, hi] = WEARS.find((x) => x[0] === w);
+        const a = Math.max(lo, sk.min), b = Math.min(hi, sk.max);
+        const base = (o.price ? o.price(E.hashName(name, w, st)) : null) || 20 + rand() * 200;
+        const n = 1 + Math.floor(rand() * (o.depth || 3));
+        const pile = rand() < 0.6;
+        out[E.hashName(name, w, st)] = Array.from({ length: n }, () =>
+          [a + rand() * (b - a) * 0.999, Math.round((pile ? base : base * (0.8 + rand() * 0.5)) * 100) / 100]);
+      }
+    }
+  }
+  return out;
+}
+
+/** reference : tous les ensembles de 5 items distincts, evalues un par un */
+function bruteStock(cat, pr, listings, o) {
+  const m = E.create(cat, pr, { fee: o.fee });
+  const items = [];
+  for (const col of cat.collections) {
+    for (const name of col.inputs) {
+      const sk = cat.coverts[name];
+      if (o.st && !sk.st) continue;
+      for (const w of sk.wears) {
+        for (const [f, p] of listings[E.hashName(name, w, o.st)] || []) {
+          items.push({ name, float: f, price: p * (o.rate || 1), trade: p, src: "stock", case: col.case });
+        }
+      }
+    }
+  }
+  const need = 5 - (o.fillers || 0), budget = o.budget || Infinity;
+  const best = {};
+  let overall = -Infinity, combos = 0;
+  const n = items.length;
+  for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++)
+    for (let d = c + 1; d < n; d++) for (let e = d + 1; e < n; e++) {
+      const pick = [items[a], items[b], items[c], items[d], items[e]];
+      if (pick.reduce((s, x) => s + x.price, 0) > budget) continue;
+      const r = m.evaluate(pick, { st: o.st });
+      if (r.profit == null) continue;
+      combos++;
+      if (r.profit > overall) overall = r.profit;
+      const per = {};
+      for (const x of pick) per[x.case] = (per[x.case] || 0) + 1;
+      for (const [cs, k] of Object.entries(per)) {
+        if (k >= need && !(best[cs] >= r.profit)) best[cs] = r.profit;
+      }
+    }
+  return { best, overall, combos, n };
+}
+
+function checkStock(cat, pr, listings, o, label) {
+  const got = E.create(cat, pr, { fee: o.fee }).stockContracts(Object.assign({ listings }, o));
+  const ref = bruteStock(cat, pr, listings, o);
+  const seen = new Set();
+  for (const r of got) {
+    seen.add(r.case);
+    near(r.profit, ref.best[r.case], 1e-9, `${label} ${r.case}`);
+    near(r.ev - r.cost, r.profit, 1e-9, "profit = EV - cout");
+    assert.ok(r.inputs.filter((x) => x.case === r.case).length >= 5 - (o.fillers || 0), `${label} : caisse principale minoritaire`);
+    if (o.budget) assert.ok(r.cost <= o.budget + 1e-9, `${label} : budget depasse`);
+  }
+  for (const cs of Object.keys(ref.best)) assert.ok(seen.has(cs), `${label} : ${cs} manquant`);
+  if (isFinite(ref.overall)) near(got.overall.profit, ref.overall, 1e-9, `${label} meilleur global`);
+  else assert.strictEqual(got.overall, null);
+  return ref;
+}
+
+test("stock reel = enumeration complete (jouet, 24 tirages, melanges et budgets)", () => {
+  let combos = 0, runs = 0;
+  for (let seed = 1; seed <= 24; seed++) {
+    const rand = rng(seed);
+    const st = seed % 4 === 0;
+    const listings = randomStock(toy, rand, { st, skip: 0.25, depth: 3 });
+    for (const fillers of [0, 1, 2]) {
+      const o = { st, fee: 2, fillers, rate: seed % 3 ? 1 : 0.6 };
+      const ref = checkStock(toy, prices, listings, o, `graine ${seed} complements ${fillers}`);
+      combos += ref.combos; runs++;
+      if (seed % 5 === 0 && isFinite(ref.overall)) {
+        // budget serre : moitie du cout du meilleur contrat sans budget
+        const free = E.create(toy, prices, { fee: 2 }).stockContracts(Object.assign({ listings }, o));
+        checkStock(toy, prices, listings, Object.assign({}, o, { budget: free.overall.cost * 0.8 }), `graine ${seed} budget`);
+      }
+    }
+  }
+  console.log(`      ${runs} optimisations verifiees sur ${combos} contrats enumeres`);
+});
+
+test("stock reel : un complement d'une autre caisse peut battre le 100 %", () => {
+  // Caisse H : couteau a 5000 en FN (float < 0.07 sur 0-0.08 => position < 0.875),
+  // mais ses Coverts en stock sont hauts. Caisse L : Coverts bas et pas chers.
+  const cat = {
+    wears: WEARS,
+    coverts: { "H | h": { min: 0, max: 1, st: false, wears: allW }, "L | l": { min: 0, max: 1, st: false, wears: allW } },
+    golds: {
+      "★ D | d": { min: 0, max: 0.08, st: false, kind: "knife", wears: ["Factory New", "Minimal Wear"], phases: [] },
+      "★ R | r": { min: 0, max: 1, st: false, kind: "knife", wears: allW, phases: [] },
+    },
+    collections: [
+      { case: "H", hash: "H", inputs: ["H | h"], pool: [["★ D | d", 1]] },
+      { case: "L", hash: "L", inputs: ["L | l"], pool: [["★ R | r", 1]] },
+    ],
+  };
+  const p = px({ "★ D | d (Factory New)": 5000, "★ D | d (Minimal Wear)": 1000,
+                 "★ R | r (Factory New)": 900, "★ R | r (Battle-Scarred)": 100 });
+  const listings = {
+    "H | h (Battle-Scarred)": [[0.95, 150], [0.96, 150], [0.97, 150], [0.98, 150], [0.99, 150]],
+    "L | l (Factory New)": [[0.01, 60], [0.02, 60]],
+  };
+  const m = E.create(cat, p, { fee: 0 });
+  const pure = m.stockContracts({ listings }).find((r) => r.case === "H");
+  const mix = m.stockContracts({ listings, fillers: 2 }).find((r) => r.case === "H");
+  // 100 % H : x = 0.97 -> MW, EV 1000, profit 250.
+  // 4 H + 1 L : x = (0.95+0.96+0.97+0.98+0.01)/5 = 0.774 -> D FN, EV 4/5 x 5000 + 1/5 x 100,
+  // profit 3360 ; 3 H + 2 L (x = 0.582) ne rapporte que 2470.
+  near(pure.ev, 1000, 1e-9, "100 % H");
+  assert.strictEqual(mix.fillers, 1);
+  near(mix.ev, 0.8 * 5000 + 0.2 * 100, 1e-9, "4 H + 1 L");
+  near(mix.profit, 3360, 1e-9, "profit 4 H + 1 L");
+  near(m.stockContracts({ listings, fillers: 2 }).overall.profit, 3360, 1e-9, "meilleur global");
+  checkStock(cat, p, listings, { fee: 0, fillers: 2 }, "melange");
+});
+
+test("donnees reelles : stock simule, exact et rapide", () => {
+  const dir = path.join(__dirname, "..", "site", "data");
+  const cat = JSON.parse(fs.readFileSync(path.join(dir, "catalog.json")));
+  const pr = JSON.parse(fs.readFileSync(path.join(dir, "prices.json")));
+  const base = E.create(cat, pr, { fee: 2 });
+  const price = (h) => { const q = base.quote(h); return q ? q.price * 1.8 : null; };
+  let worst = 0, n = 0;
+  for (const st of [false, true]) {
+    const listings = randomStock(cat, rng(st ? 7 : 3), { st, skip: 0.2, depth: 8, price });
+    const m = E.create(cat, pr, { fee: 2 });
+    for (const fillers of [0, 2]) {
+      const t0 = Date.now();
+      const list = m.stockContracts({ listings, st, fillers, rate: 0.6 });
+      const ms = Date.now() - t0;
+      worst = Math.max(worst, ms); n++;
+      assert.ok(list.length > 10, `peu de contrats (${list.length})`);
+      for (const r of list) {
+        near(r.ev - r.cost, r.profit, 1e-9, "profit = EV - cout");
+        assert.ok(r.inputs.every((x) => x.exact && x.q.src === "stock"), "items precis");
+        if (fillers === 0) assert.ok(!r.mixed, "100 % une caisse");
+      }
+      if (fillers === 2) {
+        // le melange ne fait jamais moins bien que le 100 % de la meme caisse
+        const pure = m.stockContracts({ listings, st, fillers: 0, rate: 0.6 });
+        for (const r of pure) {
+          const mx = list.find((x) => x.case === r.case);
+          assert.ok(mx && mx.profit >= r.profit - 1e-9, `${r.case} : melange ${mx && mx.profit} < pur ${r.profit}`);
+        }
+        assert.ok(list.overall.profit >= list[0].profit - 1e-9, "meilleur global >= meilleur par caisse");
+      }
+      console.log(`      st=${st} complements=${fillers} : ${list.length} contrats, ${list.items} items utiles, ` +
+                  `meilleur ${list[0].profit.toFixed(2)} (${ms} ms)`);
+    }
+    // exactitude sur de vraies caisses : enumeration complete d'un petit stock
+    const small = randomStock(cat, rng(st ? 11 : 5), { st, skip: 0.5, depth: 2, price });
+    const cs = cat.collections.filter((c) => c.inputs.length >= 2).slice(0, 4);
+    const keep = {};
+    for (const c of cs) for (const name of c.inputs) for (const w of cat.coverts[name].wears) {
+      const h = E.hashName(name, w, st);
+      if (small[h]) keep[h] = small[h];
+    }
+    const sub = { ...cat, collections: cs };
+    checkStock(sub, pr, keep, { st, fee: 2, fillers: 2, rate: 0.6 }, `vraies caisses st=${st}`);
+  }
+  assert.ok(worst < 3000, `trop lent : ${worst} ms`);
 });
 
 console.log(`\n${passed} tests passes`);

@@ -387,7 +387,8 @@
         }
         const hash = hashName(it.name, wear, st);
         const manual = it.price != null && it.price !== "" && isFinite(it.price);
-        const q = manual ? { price: +it.price, src: "manual", stale: false }
+        // prix impose : saisi a la main, ou item precis en stock (src "ti" + prix d'echange)
+        const q = manual ? { price: +it.price, src: it.src || "manual", trade: it.trade, stale: false }
           : (inputQuote ? inputQuote(hash) : quote(hash));
         return { name: it.name, case: col.case, col, wear, float, exact, x, hash, q,
                  price: q ? q.price : null, img: sk.img };
@@ -494,6 +495,251 @@
       return out;
     }
 
+    /**
+     * Meilleurs contrats avec des items PRECIS en stock : float exact, prix
+     * propre a chaque item, un seul exemplaire de chacun.
+     *   listings : { market_hash_name: [[float, prix], ...] }
+     *   rate     : multiplie chaque prix (prix d'echange tradeit -> valeur
+     *              marche des items que tu cedes) ; le prix d'origine reste
+     *              dans q.trade de chaque input
+     *   fillers  : inputs d'autres caisses permis a cote de la caisse
+     *              principale (0 = contrat 100 % d'une caisse, 2 au plus)
+     *   budget   : cout maximal d'un contrat (dans l'unite de price)
+     * Rend le meilleur contrat de chaque caisse principale, trie, avec
+     * .overall = le meilleur toutes caisses confondues.
+     *
+     * Methode exacte. La valeur attendue ne depend que de la caisse de chaque
+     * input et de la position moyenne x des inputs. Entre deux frontieres
+     * d'usure des golds, un item apporte une part fixe
+     *   w = valeur moyenne des golds de sa caisse / 5 - son prix,
+     * et il reste a choisir les 5 items de plus grande somme w dont la
+     * moyenne des positions reste sous la frontiere (branch & bound). La
+     * valeur ne montant jamais avec x, un contrat plus bas que l'intervalle
+     * vaut au moins autant : le maximum sur les intervalles est le bon.
+     */
+    function stockContracts(o) {
+      o = o || {};
+      const st = !!o.st;
+      const rate = o.rate > 0 ? o.rate : 1;
+      const budget = o.budget > 0 ? o.budget : Infinity;
+      const need = SLOTS - Math.min(2, Math.max(0, Math.round(o.fillers || 0)));
+      const listings = o.listings || {};
+
+      const cols = [];
+      for (const col of catalog.collections) {
+        const pool = poolOf(col, st);
+        if (!pool.length) continue;
+        let items = [];
+        for (const name of col.inputs) {
+          const sk = catalog.coverts[name];
+          if (st && !sk.st) continue;
+          for (const w of sk.wears) {
+            const hash = hashName(name, w, st);
+            for (const [f, p] of listings[hash] || []) {
+              if (!(f >= sk.min && f <= sk.max) || !(p > 0)) continue;
+              const x = floatMode === "raw" ? f : (f - sk.min) / (sk.max - sk.min);
+              items.push({ name, wear: w, hash, float: f, x, trade: p, price: p * rate });
+            }
+          }
+        }
+        // Un item que 5 autres items de la meme caisse battent a la fois sur
+        // le prix et sur la position ne sert jamais : un contrat en prend au
+        // plus 4 autres, on l'echange contre un libre (meme caisse, moins cher,
+        // position plus basse donc valeur au moins egale).
+        items = items.filter((a) => {
+          let beaten = 0;
+          for (const b of items) {
+            if (b !== a && b.price <= a.price && b.x <= a.x && (b.price < a.price || b.x < a.x) && ++beaten >= SLOTS) return false;
+          }
+          return true;
+        });
+        if (items.length) cols.push({ col, items, curve: othersCurve(pool, null, st) });
+      }
+      const all = [];
+      cols.forEach((c, ci) => c.items.forEach((it) => { it.ci = ci; all.push(it); }));
+
+      // Items interchangeables (meme skin, meme usure, meme prix) : on les
+      // prend toujours du plus bas float au plus haut, ce qui evite
+      // d'explorer plusieurs fois le meme contrat.
+      all.sort((a, b) => a.x - b.x);
+      const groups = new Map();
+      for (const it of all) {
+        const k = it.hash + "\u0000" + it.price;
+        if (!groups.has(k)) groups.set(k, { id: groups.size, n: 0 });
+        const g = groups.get(k);
+        it.g = g.id; it.rank = g.n++;
+      }
+      const taken = new Int32Array(groups.size);
+
+      // intervalles de x ou aucun gold ne change d'usure, et valeur de chaque caisse
+      const T = [...new Set(cols.flatMap((c) => c.curve.xs))].sort((a, b) => a - b);
+      const V = cols.map((c) => T.map((t) => curveAt(c.curve, t)));
+      const locate = (x) => {
+        let lo = 0, hi = T.length - 1;
+        while (lo < hi) { const m = (lo + hi + 1) >> 1; if (T[m] <= x) lo = m; else hi = m - 1; }
+        return lo;
+      };
+
+      /** liste triee par w decroissant, avec sommes et minima de suffixe pour les bornes */
+      function seq(L) {
+        const n = L.length;
+        const pre = new Float64Array(n + 1), minX = new Float64Array(n + 1), minP = new Float64Array(n + 1);
+        for (let i = 0; i < n; i++) pre[i + 1] = pre[i] + L[i].w;
+        minX[n] = minP[n] = Infinity;
+        for (let i = n - 1; i >= 0; i--) {
+          minX[i] = Math.min(L[i].it.x, minX[i + 1]);
+          minP[i] = Math.min(L[i].it.price, minP[i + 1]);
+        }
+        return { L, n, pre, minX, minP };
+      }
+      const top = (s, c) => (c <= s.n ? s.pre[c] : -Infinity);
+
+      // par intervalle : tous les items tries par part w, et ceux de chaque caisse
+      const lists = T.map((t, j) => {
+        const L = all.map((it) => ({ it, w: V[it.ci][j] / SLOTS - it.price }))
+          .sort((a, b) => b.w - a.w || a.it.x - b.it.x);
+        const byCol = cols.map(() => []);
+        for (const e of L) byCol[e.it.ci].push(e);
+        return { hi: j + 1 < T.length ? T[j + 1] : Infinity, L, byCol: byCol.map(seq), any: null };
+      });
+
+      /**
+       * Items utiles sur un intervalle quand la caisse importe peu : un item
+       * que 5 autres battent a la fois sur w, la position et le prix est
+       * remplacable (les 5 premiers qui le battent sont eux-memes gardes).
+       */
+      function anyOf(d) {
+        if (d.any) return d.any;
+        const keep = [];
+        if (budget === Infinity) {
+          // les items precedents ont tous un w au moins egal : il suffit que
+          // 5 d'entre eux aient une position au plus egale
+          const low = [];                                  // 5 plus petites positions vues
+          for (const e of d.L) {
+            const x = e.it.x;
+            if (low.length < SLOTS || low[SLOTS - 1] > x) keep.push(e);
+            if (low.length < SLOTS) low.push(x);
+            else if (x < low[SLOTS - 1]) low[SLOTS - 1] = x;
+            else continue;
+            for (let i = low.length - 1; i > 0 && low[i] < low[i - 1]; i--) {
+              const t = low[i]; low[i] = low[i - 1]; low[i - 1] = t;
+            }
+          }
+        } else {
+          const L = d.L;
+          for (let i = 0; i < L.length; i++) {
+            const a = L[i].it;
+            let beaten = 0;
+            for (let k = 0; k < i && beaten < SLOTS; k++) {
+              const b = L[k].it;
+              if (b.x <= a.x && b.price <= a.price) beaten++;
+            }
+            if (beaten < SLOTS) keep.push(L[i]);
+          }
+        }
+        return (d.any = seq(keep));
+      }
+
+      /**
+       * Recherche en etages : `count` items pris dans chaque liste, dans
+       * l'ordre (les complements d'abord, sans la caisse `skip`), en gardant
+       * la moyenne des positions sous `hi`. Met a jour ctx si mieux.
+       */
+      function run(stages, hi, ctx, skip) {
+        const ns = stages.length, hiSum = hi * SLOTS;
+        const restW = new Float64Array(ns + 1), restX = new Float64Array(ns + 1), restP = new Float64Array(ns + 1);
+        for (let s = ns - 1; s >= 0; s--) {
+          const [S, c] = stages[s];
+          restW[s] = restW[s + 1] + top(S, c);
+          restX[s] = restX[s + 1] + c * S.minX[0];
+          restP[s] = restP[s + 1] + c * S.minP[0];
+        }
+        const pick = [];
+        (function rec(s, start, left, wsum, xs, cost) {
+          if (!left) {
+            if (s + 1 < ns) { rec(s + 1, 0, stages[s + 1][1], wsum, xs, cost); return; }
+            const x = xs / SLOTS;
+            if (!(x < hi)) return;
+            const jj = locate(x);                           // intervalle reel : valeur exacte
+            let ev = 0;
+            for (const e of pick) ev += V[e.it.ci][jj];
+            const profit = ev / SLOTS - cost;
+            if (profit > ctx.best) { ctx.best = profit; ctx.pick = pick.map((e) => e.it); }
+            return;
+          }
+          const { L, n, pre, minX, minP } = stages[s][0];
+          const rw = restW[s + 1], rx = restX[s + 1], rp = restP[s + 1];
+          for (let i = start; i <= n - left; i++) {
+            if (wsum + pre[i + left] - pre[i] + rw <= ctx.best) break;   // w decroissants
+            if (xs + left * minX[i] + rx >= hiSum) break;                // plus assez d'items assez bas
+            if (cost + left * minP[i] + rp > budget) break;
+            const e = L[i], it = e.it;
+            if (s === 0 && it.ci === skip) continue;
+            if (it.rank !== taken[it.g]) continue;
+            const more = left > 1;
+            if (xs + it.x + (more ? (left - 1) * minX[i + 1] : 0) + rx >= hiSum) continue;
+            if (cost + it.price + (more ? (left - 1) * minP[i + 1] : 0) + rp > budget) continue;
+            taken[it.g]++; pick.push(e);
+            rec(s, i + 1, left - 1, wsum + e.w, xs + it.x, cost + it.price);
+            taken[it.g]--; pick.pop();
+          }
+        })(0, 0, stages[0][1], 0, 0, 0);
+      }
+
+      /** meilleur contrat avec au moins k inputs de la caisse mc (mc = -1 : toutes caisses) */
+      function search(mc, k) {
+        const ctx = { best: -Infinity, pick: null }, plans = [];
+        for (const d of lists) {
+          if (mc < 0) {
+            const S = anyOf(d);
+            if (S.n >= SLOTS) plans.push({ d, ub: top(S, SLOTS), stages: [[S, SLOTS]], skip: -1 });
+            continue;
+          }
+          const A = d.byCol[mc];
+          for (let m = 0; m <= SLOTS - k; m++) {               // m complements d'autres caisses
+            if (A.n < SLOTS - m) continue;
+            if (!m) { plans.push({ d, ub: top(A, SLOTS), stages: [[A, SLOTS]], skip: -1 }); continue; }
+            const O = anyOf(d);
+            let ow = 0, got = 0;
+            for (let i = 0; i < O.n && got < m; i++) if (O.L[i].it.ci !== mc) { ow += O.L[i].w; got++; }
+            if (got < m) continue;
+            plans.push({ d, ub: top(A, SLOTS - m) + ow, stages: [[O, m], [A, SLOTS - m]], skip: mc });
+          }
+        }
+        // du plus prometteur au moins prometteur : on s'arrete des que la
+        // borne (sans contrainte de float) ne peut plus battre le meilleur
+        plans.sort((a, b) => b.ub - a.ub);
+        for (const p of plans) {
+          if (p.ub <= ctx.best) break;
+          run(p.stages, p.d.hi, ctx, p.skip);
+        }
+        return ctx.pick;
+      }
+
+      const contract = (pick, extra) => {
+        const r = evaluate(pick.map((it) => ({ name: it.name, float: it.float, price: it.price,
+          trade: it.trade, src: o.src || "stock" })), { st });
+        if (r.ev == null) return null;
+        const cases = [...new Set(r.inputs.map((x) => x.case))];
+        return Object.assign(r, { cases, mixed: cases.length > 1 }, extra);
+      };
+      const out = [];
+      cols.forEach((c, ci) => {
+        const pick = search(ci, need);
+        const r = pick && contract(pick, { case: c.col.case, caseImg: c.col.img, stock: c.items.length });
+        if (r) { r.fillers = r.inputs.filter((x) => x.case !== c.col.case).length; out.push(r); }
+      });
+      const gp = search(-1, 0);
+      const overall = gp ? contract(gp, {}) : null;
+
+      const key = o.sort || "profit";
+      const dir = key === "cost" ? -1 : 1;
+      out.sort((a, b) => dir * ((b[key] || 0) - (a[key] || 0)));
+      out.overall = overall;
+      out.items = all.length;
+      return out;
+    }
+
     // ------------------------------------------------- ouverture de caisses
     function unbox(target, st, minWear, col) {
       const g = catalog.golds[target];
@@ -561,7 +807,7 @@
       };
     }
 
-    return { analyze, evaluate, bestContracts, quote, quotesAll, hashName, wearOf,
+    return { analyze, evaluate, bestContracts, stockContracts, quote, quotesAll, hashName, wearOf,
              poolOf, allowedWears, goldAt, caseOf: (name) => colOf[name] };
   }
 

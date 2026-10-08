@@ -26,7 +26,7 @@
       <button type="button" role="tab" data-tab="builder">Constructeur</button>
       <button type="button" role="tab" data-tab="target">Gold visé</button>
       <button type="button" role="tab" data-tab="best">Meilleurs contrats</button>
-      <button type="button" role="tab" data-tab="tradeit">Inventaire tradeit</button>
+      <button type="button" role="tab" data-tab="tradeit">tradeit</button>
     </nav>
   </header>
 
@@ -122,6 +122,7 @@
         <li><b>Float de sortie</b> = min + moyenne des positions des inputs × (max − min) du gold. Sans float exact, c'est le pire float de l'usure choisie : l'usure annoncée est garantie.</li>
         <li><b>Valeur d'un résultat</b> = prix le plus bas actuel parmi son usure et les usures meilleures, moins tes frais de revente. Seule la phase la moins chère d'un Doppler est cotée.</li>
         <li><b>Euros</b> : Skinport cote en € ; CSFloat, DMarket et Steam en $, convertis au taux BCE du jour. Un prix de plus de 12 h n'est jamais repris.</li>
+        <li><b>tradeit</b> : le stock d'échange est relevé item par item toutes les 30 minutes (float exact, prix d'échange, piles). Un item payé en échange coûte la valeur marché de ce que tu cèdes : prix d'échange × ton taux (valeur marché ÷ valeur d'échange de tes items cochés), ou un taux estimé sans ton inventaire.</li>
         <li>Une moyenne n'est pas une promesse : un contrat rentable en moyenne peut perdre, et inversement. Les golds reçus sont bloqués 7 jours.</li>
       </ul>
     </section>
@@ -146,7 +147,7 @@
 
   <footer class="wrap muted small">
     Données de jeu : <a href="https://github.com/ByMykel/CSGO-API" rel="noopener">ByMykel/CSGO-API</a>.
-    Prix : Skinport, CSFloat, DMarket, Steam Market. Outil indépendant, non affilié à Valve ni aux marchés cités.
+    Prix : Skinport, CSFloat, DMarket, Steam Market, tradeit.gg. Outil indépendant, non affilié à Valve ni aux marchés cités.
   </footer>
 
   <script src="engine.js"></script>

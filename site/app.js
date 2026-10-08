@@ -24,12 +24,21 @@
     target: "★ Butterfly Knife | Doppler", minWear: "any",
     bestSort: "profit", bestBudget: "", ocSort: "value",
     tiOff: [],                       // items d'inventaire exclus de l'echange
+    tiView: "contracts",             // onglet tradeit : "contracts" | "stock" | "inv"
+    tiMix: 2,                        // Coverts d'autres caisses permis dans un contrat du stock
+    tiSort: "profit", tiBudget: true, tiQ: "", tiStockSort: "deal",
   };
+  // tradeit accorde environ 92 % de son prix d'echange pour un item qu'on lui
+  // cede (userPrice / sitePrice releve sur de vrais inventaires) : sert a
+  // estimer le taux quand l'inventaire n'est pas deverrouille
+  const USER_SHARE = 0.92;
   const state = Object.assign({}, DEFAULTS, mem.get("state", {}));
   if (!Array.isArray(state.slots) || state.slots.length !== 5) state.slots = DEFAULTS.slots.slice();
   const save = () => mem.set("state", state);
 
   let catalog, prices, inv = null, invFile = null;
+  let stockRaw = null, stockCache = null;     // stock de la boutique tradeit (data/tradeit.json)
+  const covertOf = {};                        // market_hash_name d'un Covert -> { name, wear, st }
   const engines = new Map();
 
   // ------------------------------------------------------------ formats
@@ -116,13 +125,80 @@
     return { price: it.tt[0] * rate, src: "ti", qty: it.tt[1], trade: it.tt[0], stale: false };
   }
 
+  /** items coches de l'inventaire : valeur d'echange et valeur marche */
+  function balance() {
+    if (!inv) return null;
+    let user = 0, market = 0;
+    for (const it of inv.items) {
+      if (state.tiOff.includes(it.key)) continue;
+      user += it.user * it.qty; market += it.market * it.qty;
+    }
+    return { user, market };
+  }
+
+  /** stock tradeit par market_hash_name, prix d'echange dans la devise des prix */
+  function stockOffers() {
+    if (!stockRaw || !stockRaw.items) return null;
+    if (!stockCache) {
+      const by = {}, listings = {};
+      let items = 0;
+      for (const [hash, offers] of Object.entries(stockRaw.items)) {
+        if (!covertOf[hash] || !Array.isArray(offers)) continue;
+        by[hash] = offers.filter((o) => o.p > 0 && o.f && o.f.length)
+          .map((o) => ({ trade: usdToBase(o.p / 100), n: o.n, f: o.f, hi: o.hi, lock: o.lock || 0 }))
+          .sort((a, b) => a.trade - b.trade);
+        listings[hash] = by[hash].flatMap((o) => o.f.map((f) => [f, o.trade]));
+        items += by[hash].reduce((s, o) => s + o.n, 0);
+      }
+      stockCache = { by, listings, items, hashes: Object.keys(by).length };
+    }
+    return stockCache;
+  }
+
+  let estMemo = null;
+  /**
+   * Taux sans inventaire : un item cede rapporte ~92 % de son prix d'echange,
+   * et les prix d'echange sont gonfles comme ceux des Coverts (rapport median
+   * echange / marche). Estimation : le vrai taux depend de tes items.
+   */
+  function estRate() {
+    const key = state.off.join(",") + "|" + (stockRaw ? stockRaw.updated_at : "");
+    if (estMemo && estMemo.key === key) return estMemo.v;
+    const m = engine("market"), r = [];
+    const so = stockOffers();
+    if (so) {
+      for (const [hash, offers] of Object.entries(so.by)) {
+        const q = m.quote(hash);
+        if (q && q.price >= 1 && offers.length) r.push(offers[0].trade / q.price);
+      }
+    } else {
+      for (const [hash, it] of Object.entries(prices.items)) {
+        const q = it.tt ? m.quote(hash) : null;
+        if (q && q.price >= 1) r.push(it.tt[0] / q.price);
+      }
+    }
+    r.sort((a, b) => a - b);
+    const v = r.length >= 10 ? 1 / (USER_SHARE * r[r.length >> 1]) : null;
+    estMemo = { key, v };
+    return v;
+  }
+
+  /** taux applique aux prix d'echange : le tien (inventaire), sinon estime */
+  function rateInfo() {
+    const r = tradeRate();
+    if (r) return { rate: r, est: false };
+    const e = estRate();
+    return e ? { rate: e, est: true } : null;
+  }
+  const fmtRate = (r) => r.toLocaleString("fr-FR", { maximumFractionDigits: 3 });
+
   function engine(pay) {
     pay = pay || state.pay;
     if (pay === "tradeit" && !tradeRate()) pay = "market";
     const key = [pay, state.fee, state.phaseMode, state.floatMode, state.off.join(","),
                  pay === "tradeit" ? tradeRate() : ""].join("|");
     if (!engines.has(key)) {
-      engines.clear();
+      if (engines.size > 3) engines.clear();          // marche + echange suffisent
       engines.set(key, TradeupEngine.create(catalog, prices, {
         fee: state.fee, phaseMode: state.phaseMode, floatMode: state.floatMode, keyPrice: KEY_PRICE,
         sources: prices.order.filter((k) => !state.off.includes(k)),
@@ -192,7 +268,8 @@
     const sk = catalog.coverts[s.name];
     const wear = row ? row.wear : s.wear;
     const fl = s.float != null && s.float !== "" ? `float ${(+s.float).toFixed(4)}` : `float &lt; ${row ? row.float.toFixed(2) : "?"}`;
-    const p = row && row.q ? `${money(row.price)} ${srcBadge(row.q, row.hash)}` : '<span class="muted">prix inconnu</span>';
+    let p = row && row.q ? `${money(row.price)} ${srcBadge(row.q, row.hash)}` : '<span class="muted">prix inconnu</span>';
+    if (s.ti != null && row && row.q && row.q.src === "ti") p += `<br><small class="muted">${money(s.ti)} d'échange</small>`;
     const col = engine().caseOf(s.name);
     return `<div class="slot filled${state.st ? " st" : ""}" data-slot="${i}" role="button" tabindex="0">
       <button type="button" class="slot-x" data-remove="${i}" aria-label="Retirer">×</button>
@@ -203,8 +280,15 @@
       <div class="slot-c">${esc(col ? col.case : "")}</div></div>`;
   }
 
+  /** item precis du stock tradeit : son prix d'echange x le taux, recalcule a chaque fois */
+  function slotInput(s) {
+    if (s.ti == null) return s;
+    const ri = rateInfo();
+    return ri ? Object.assign({}, s, { price: s.ti * ri.rate, src: "ti", trade: s.ti }) : Object.assign({}, s, { price: null });
+  }
+
   function evaluateSlots() {
-    const filled = state.slots.map((s, i) => (s ? Object.assign({ __i: i }, s) : null)).filter(Boolean);
+    const filled = state.slots.map((s, i) => (s ? Object.assign({ __i: i }, slotInput(s)) : null)).filter(Boolean);
     const r = engine().evaluate(filled, { st: state.st });
     r.inputs.forEach((row, k) => { row.__i = filled[k].__i; });
     return r;
@@ -217,9 +301,33 @@
   }
 
   function payNote() {
-    if (state.pay !== "tradeit") return "";
+    let t = "";
     const rate = tradeRate();
-    return rate ? `<p class="muted small">Inputs payés en échange tradeit : prix d'échange × ${rate.toLocaleString("fr-FR", { maximumFractionDigits: 3 })} (valeur marché de tes items cédée par unité d'échange).</p>` : "";
+    if (state.pay === "tradeit" && rate) {
+      t += `<p class="muted small">Inputs payés en échange tradeit : prix d'échange × ${fmtRate(rate)} (valeur marché de tes items cédée par unité d'échange).</p>`;
+    }
+    const ri = state.slots.some((s) => s && s.ti != null) ? rateInfo() : null;
+    if (ri) {
+      t += `<p class="muted small">Items précis du stock tradeit : prix d'échange × ${fmtRate(ri.rate)}
+        ${ri.est ? "(taux estimé : déverrouille ton inventaire dans l'onglet tradeit pour ton taux réel)" : "(ton taux, items cochés)"}
+        = valeur marché de ce que tu cèdes.</p>`;
+    }
+    return t;
+  }
+
+  /** cartes des resultats possibles d'un contrat */
+  function ocCards(list) {
+    return list.map((o) => {
+      const cls = o.profit == null ? "" : o.profit >= 0 ? "w" : "l";
+      const fl = o.float != null ? ` · ${o.float.toFixed(4)}` : "";
+      return `<div class="oc ${cls}">
+        ${img(o.img, o.name)}
+        <div class="oc-n">${state.st && catalog.golds[o.name].st ? "StatTrak™ " : ""}${esc(short(o.name))}</div>
+        <div class="oc-w">${esc(o.wear ? SHORT[o.wear] : "sans usure")}${fl}${o.cappedBy ? ` · coté au prix ${esc(SHORT[o.cappedBy])}` : ""}</div>
+        <div class="oc-r"><span class="oc-p">${pct(o.p)}</span><span class="oc-v">${o.net != null ? money(o.net) : "?"}</span></div>
+        <div class="oc-g ${cls === "w" ? "win" : cls === "l" ? "loss" : "muted"}">${o.profit != null ? `${signed(o.profit)} <small>(${pct(o.roi, true)})</small>` : (o.net == null ? "sans prix actuel" : "")}</div>
+      </div>`;
+    }).join("");
   }
 
   function builderResult(r) {
@@ -258,17 +366,7 @@
       name: (a, b) => a.name.localeCompare(b.name),
     };
     const list = r.outcomes.slice().sort(sorters[state.ocSort] || sorters.value);
-    const cards = list.map((o) => {
-      const cls = o.profit == null ? "" : o.profit >= 0 ? "w" : "l";
-      const fl = o.float != null ? ` · ${o.float.toFixed(4)}` : "";
-      return `<div class="oc ${cls}">
-        ${img(o.img, o.name)}
-        <div class="oc-n">${state.st && catalog.golds[o.name].st ? "StatTrak™ " : ""}${esc(short(o.name))}</div>
-        <div class="oc-w">${esc(o.wear ? SHORT[o.wear] : "sans usure")}${fl}${o.cappedBy ? ` · coté au prix ${esc(SHORT[o.cappedBy])}` : ""}</div>
-        <div class="oc-r"><span class="oc-p">${pct(o.p)}</span><span class="oc-v">${o.net != null ? money(o.net) : "?"}</span></div>
-        <div class="oc-g ${cls === "w" ? "win" : cls === "l" ? "loss" : "muted"}">${o.profit != null ? `${signed(o.profit)} <small>(${pct(o.roi, true)})</small>` : (o.net == null ? "sans prix actuel" : "")}</div>
-      </div>`;
-    }).join("");
+    const cards = ocCards(list);
     return errs + head + payNote() + `
       <div class="res-head"><h2>Résultats possibles (${r.outcomes.length})</h2>
         <label>Trier <select id="oc-sort">
@@ -280,7 +378,7 @@
   }
 
   // ----------------------------------------------------------- selecteur
-  const pk = { slot: 0, name: null, wear: null, float: "", price: "" };
+  const pk = { slot: 0, name: null, wear: null, float: "", price: "", ti: null };
 
   function openPicker(i) {
     pk.slot = i;
@@ -289,6 +387,7 @@
     pk.wear = s ? s.wear : null;
     pk.float = s && s.float != null ? s.float : "";
     pk.price = s && s.price != null ? s.price : "";
+    pk.ti = s && s.ti != null ? s.ti : null;
     $("#pk-title").textContent = `Case ${i + 1} : choisir un Covert`;
     renderPickerList();
     renderPickerDetail();
@@ -356,13 +455,17 @@
         <b>${esc(SHORT[w])}</b><small>${q ? money(q.price) : "—"}</small></button>`;
     }).join("");
     const empty = state.slots.filter((s, i) => !s && i !== pk.slot).length;
+    const ri = pk.ti != null ? rateInfo() : null;
+    const chosen = pk.ti != null ? `<p class="ti-pick small">Item tradeit choisi : <b>${esc(SHORT[pk.wear])} ${(+pk.float).toFixed(4)}</b>,
+        ${money(pk.ti)} d'échange${ri ? ` ≈ ${money(pk.ti * ri.rate)} cédés` : ""}.</p>` : "";
     box.innerHTML = `${img(sk.img, pk.name)}
       <div><b>${state.st ? "StatTrak™ " : ""}${esc(pk.name)}</b><br><span class="muted small">${esc(engine().caseOf(pk.name).case)} · float ${sk.min}–${sk.max}</span></div>
       <div><span class="muted small">Usure</span><div class="wears">${wears}</div></div>
+      ${pickerStock(sk)}${chosen}
       <label>Float exact (facultatif)
-        <input id="pk-float" type="number" step="0.0001" min="${sk.min}" max="${sk.max}" placeholder="${sk.min} – ${sk.max}" value="${esc(pk.float)}" inputmode="decimal"></label>
+        <input id="pk-float" type="number" step="any" min="${sk.min}" max="${sk.max}" placeholder="${sk.min} – ${sk.max}" value="${esc(pk.float)}" inputmode="decimal"></label>
       <label>Ton prix (facultatif)
-        <input id="pk-price" type="number" step="0.01" min="0" placeholder="prix du marché" value="${esc(pk.price)}" inputmode="decimal"></label>
+        <input id="pk-price" type="number" step="0.01" min="0" placeholder="${pk.ti != null ? "prix tradeit" : "prix du marché"}" value="${esc(pk.price)}" inputmode="decimal"></label>
       <p class="muted small">Sans float exact, on prend le pire float de l'usure choisie. Ton prix remplace le prix du marché (item déjà possédé, autre site).</p>
       <div class="pk-actions">
         <button type="button" class="btn" id="pk-put">Mettre dans la case ${pk.slot + 1}</button>
@@ -378,7 +481,42 @@
     price = price === "" ? null : Math.max(0, parseFloat(price));
     if (f != null && !isFinite(f)) f = null;
     if (price != null && !isFinite(price)) price = null;
-    return { name: pk.name, wear: pk.wear, float: f, price };
+    // l'item tradeit choisi tient tant que son float et son prix ne sont pas modifies
+    const ti = pk.ti != null && f != null && pk.float !== "" && Math.abs(f - +pk.float) < 1e-9 && price == null ? pk.ti : null;
+    return { name: pk.name, wear: pk.wear, float: f, price, ti };
+  }
+
+  /** stock tradeit du Covert choisi : une ligne par pile, ses plus bas floats cliquables */
+  function pickerStock(sk) {
+    const so = stockOffers();
+    if (!so) return "";
+    const ri = rateInfo();
+    const rows = [];
+    for (const w of sk.wears) {
+      const hash = TradeupEngine.hashName(pk.name, w, state.st);
+      for (const o of so.by[hash] || []) {
+        const btns = o.f.map((f) => {
+          const sel = pk.ti === o.trade && pk.float !== "" && Math.abs(+pk.float - f) < 1e-12;
+          return `<button type="button" class="fl${sel ? " sel" : ""}" data-tif="${f}" data-tiw="${esc(w)}" data-tip="${o.trade}">${f.toFixed(4)}</button>`;
+        }).join("");
+        rows.push(`<div class="pk-offer"><div><b>${esc(SHORT[w])}</b><span class="muted small">${o.n} en stock${o.lock ? ` · bloqué ${o.lock} j` : ""}</span>
+            <span class="p">${money(o.trade)} <small class="muted">d'échange${ri ? ` ≈ ${money(o.trade * ri.rate)}` : ""}</small></span></div>
+          <div class="fls">${btns}${o.n > o.f.length ? `<span class="muted small">+ ${o.n - o.f.length} jusqu'à ${o.hi.toFixed(4)}</span>` : ""}</div></div>`);
+      }
+    }
+    return `<div class="pk-stock"><span class="muted small">Stock tradeit${ri && ri.est ? " (≈ € cédés au taux estimé)" : ""} : même prix pour toute une pile, prends le plus bas float.</span>
+      ${rows.length ? rows.join("") : `<p class="muted small" style="margin:0">Pas en stock chez tradeit${state.st ? " en StatTrak™" : ""}.</p>`}</div>`;
+  }
+
+  /** remplit les cases vides avec v ; un item tradeit est unique : les cases suivantes prennent les floats suivants de sa pile */
+  function fillEmpty(v) {
+    if (v.ti == null) { state.slots = state.slots.map((s) => s || Object.assign({}, v)); return; }
+    const so = stockOffers();
+    const hash = TradeupEngine.hashName(v.name, v.wear, state.st);
+    const offer = so && (so.by[hash] || []).find((o) => o.trade === v.ti);
+    const used = new Set(state.slots.filter((s) => s && s.ti === v.ti && s.name === v.name).map((s) => s.float));
+    const free = offer ? offer.f.filter((f) => !used.has(f) && f !== v.float) : [];
+    state.slots = state.slots.map((s) => s || (free.length ? Object.assign({}, v, { float: free.shift() }) : null));
   }
 
   // ========================================================== GOLD VISE
@@ -520,39 +658,210 @@
   async function renderTradeit() {
     const root = $("#ti-root");
     const file = await loadInventoryFile();
-    if (!file) {
-      root.innerHTML = `<div class="panel"><h2>Ton inventaire tradeit n'est pas encore relevé</h2>
-        <p>Le relevé automatique lit ton inventaire via tradeit avec ton identifiant Steam (inventaire Steam public, aucune connexion),
-        récupère la valeur exacte que tradeit t'accorde pour chaque item, puis <b>chiffre</b> le tout avec une phrase secrète
-        avant de le publier. Seul ton navigateur peut le déchiffrer.</p>
-        <ol class="steps">
-          <li>Dépôt GitHub → <b>Settings → Secrets and variables → Actions</b> → <i>New repository secret</i> :
-            nom <code>STEAM_ID</code>, valeur = ton identifiant Steam 64 bits (17 chiffres, commence par 7656…).
-            En secret, il reste masqué dans les logs publics du dépôt.</li>
-          <li>Deuxième secret : nom <code>INVENTORY_KEY</code>, valeur = une phrase secrète de ton choix (elle chiffre l'inventaire).</li>
-          <li>Attends le prochain relevé (30 min max), puis reviens ici et entre la phrase secrète.</li>
-        </ol></div>`;
-      return;
-    }
-    if (!inv) {
+    if (file && !inv) {
       const saved = mem.get("invpass", null);
       if (saved) {
-        try { await unlock(saved, true); return renderTradeit(); } catch (e) { mem.del("invpass"); }
+        try { await unlock(saved, true); } catch (e) { mem.del("invpass"); }
       }
-      root.innerHTML = `<div class="panel"><h2>Inventaire tradeit chiffré</h2>
-        <p class="muted small">Relevé ${esc(ago(file.updated_at))}. Entre ta phrase secrète (secret <code>INVENTORY_KEY</code>) : le déchiffrement se fait dans ton navigateur.</p>
+    }
+    const view = ["contracts", "stock", "inv"].includes(state.tiView) ? state.tiView : "contracts";
+    const seg = [["contracts", "Meilleurs contrats"], ["stock", "Coverts en stock"], ["inv", "Mon inventaire"]]
+      .map(([k, l]) => `<button type="button" data-tiview="${k}" aria-pressed="${k === view}">${l}</button>`).join("");
+    const body = view === "stock" ? tiStock() : view === "inv" ? tiInventory(file) : tiContracts();
+    root.innerHTML = tiHead(file) + `<div class="seg ti-seg" role="group" aria-label="Vue tradeit">${seg}</div>` + body;
+  }
+
+  const SETUP = `<p>Le relevé automatique lit ton inventaire via tradeit avec ton identifiant Steam (inventaire Steam public, aucune connexion),
+      récupère la valeur exacte que tradeit t'accorde pour chaque item, puis <b>chiffre</b> le tout avec une phrase secrète
+      avant de le publier. Seul ton navigateur peut le déchiffrer.</p>
+    <ol class="steps">
+      <li>Dépôt GitHub → <b>Settings → Secrets and variables → Actions</b> → <i>New repository secret</i> :
+        nom <code>STEAM_ID</code>, valeur = ton identifiant Steam 64 bits (17 chiffres, commence par 7656…).
+        En secret, il reste masqué dans les logs publics du dépôt.</li>
+      <li>Deuxième secret : nom <code>INVENTORY_KEY</code>, valeur = une phrase secrète de ton choix (elle chiffre l'inventaire).</li>
+      <li>Attends le prochain relevé (30 min max), puis reviens ici et entre la phrase secrète.</li>
+    </ol>`;
+
+  /** haut de l'onglet : soldes de l'inventaire, ou deverrouillage, ou mise en place */
+  function tiHead(file) {
+    if (!file) {
+      return `<div class="panel"><details><summary><b>Ton inventaire tradeit n'est pas encore relevé</b>
+        <span class="muted small">— sans lui, les calculs utilisent un taux d'échange estimé</span></summary>${SETUP}</details></div>`;
+    }
+    if (!inv) {
+      return `<div class="panel"><h2>Inventaire tradeit chiffré</h2>
+        <p class="muted small">Relevé ${esc(ago(file.updated_at))}. Entre ta phrase secrète (secret <code>INVENTORY_KEY</code>) : le déchiffrement se fait dans ton navigateur.
+        Sans elle, les calculs utilisent un taux d'échange estimé.</p>
         <form id="ti-unlock" class="ti-form">
           <label>Phrase secrète <input id="ti-pass" type="password" autocomplete="current-password" required></label>
           <label class="switch" style="flex:0 0 auto"><input type="checkbox" id="ti-remember" checked><span>Se souvenir sur cet appareil</span></label>
           <button class="btn" type="submit">Déverrouiller</button>
         </form><p id="ti-err" class="loss small"></p></div>`;
-      return;
     }
+    const b = balance(), rate = tradeRate();
+    return `<div class="kpis">
+        <div class="kpi best"><span>Valeur d'échange tradeit</span><b>${money(b.user)}</b><small>ce que tradeit t'accorde (items cochés)</small></div>
+        <div class="kpi"><span>Valeur marché</span><b>${money(b.market)}</b><small>mêmes items au prix du marché</small></div>
+        <div class="kpi"><span>Taux</span><b>${rate ? fmtRate(rate) : "—"}</b><small>€ de marché cédés par € d'échange</small></div>
+        <div class="kpi"><span>Relevé</span><b>${esc(ago(inv.updated_at))}</b><small>${inv.items.length} types d'items</small></div>
+      </div>`;
+  }
 
+  const noStock = () => `<div class="panel empty">Le stock tradeit n'est pas encore relevé : il l'est automatiquement toutes les 30 minutes, item par item.</div>`;
+  function stockAge() {
+    const h = stockRaw && stockRaw.updated_at ? (Date.now() - new Date(stockRaw.updated_at)) / 3600000 : Infinity;
+    return `Stock relevé ${esc(ago(stockRaw.updated_at))}${stockRaw.complete === false ? " (relevé partiel)" : ""}` +
+      (h > 2 ? ` <b class="loss">— ancien, des items ont pu partir</b>` : "");
+  }
+
+  // ---------------------------------------------- contrats sur le stock
+  let tiList = null, tiKey = "";
+  function stockList(ri, budget) {
+    const so = stockOffers();
+    const key = [state.st, state.tiMix, state.tiSort, budget, ri.rate, state.fee, state.phaseMode,
+                 state.floatMode, state.off.join(","), stockRaw.updated_at, state.cur].join("|");
+    if (key !== tiKey) {
+      tiList = engine("market").stockContracts({ listings: so.listings, rate: ri.rate, st: state.st,
+        fillers: +state.tiMix, budget, sort: state.tiSort, src: "ti" });
+      tiKey = key;
+    }
+    return tiList;
+  }
+
+  function tiContracts() {
+    const so = stockOffers();
+    if (!so) return noStock();
+    const ri = rateInfo();
+    if (!ri) return `<div class="panel empty">Pas assez de prix de marché pour estimer le taux d'échange.</div>`;
+    const b = balance();
+    const budget = b && state.tiBudget && b.user > 0 ? b.user * ri.rate : 0;
+    const list = stockList(ri, budget);
+    const opt = (v, l, cur) => `<option value="${v}"${String(cur) === String(v) ? " selected" : ""}>${l}</option>`;
+    const good = list.filter((r) => r.profit > 0).length;
+    const ov = list.overall;
+    // meilleur contrat toutes caisses : affiche a part s'il n'a pas de caisse principale
+    const ovCard = ov && !list.some((r) => Math.abs(r.profit - ov.profit) < 1e-9) ? tiCard(ov, -1) : "";
+    const cards = list.map((r, i) => tiCard(r, i)).join("");
+    return `<div class="panel"><div class="panel-head"><h2>Meilleurs contrats avec le stock tradeit</h2>
+        <div class="btns">
+          <label>Composition <select id="ti-mix">${opt(0, "100 % une caisse", state.tiMix)}${opt(1, "+ 1 Covert d'une autre caisse", state.tiMix)}${opt(2, "+ 2 Coverts d'autres caisses", state.tiMix)}</select></label>
+          <label>Trier par <select id="ti-sort">${opt("profit", "Profit moyen (€)", state.tiSort)}${opt("roi", "Rentabilité (%)", state.tiSort)}${opt("pWin", "Chance de profit", state.tiSort)}${opt("cost", "Coût le plus bas", state.tiSort)}</select></label>
+          ${b ? `<label class="switch"><input type="checkbox" id="ti-budget"${state.tiBudget ? " checked" : ""}><span>Dans mon solde (${money(b.user)} d'échange)</span></label>` : ""}
+        </div></div>
+        <p class="muted small">Pour chaque caisse, les 5 items <b>précis</b> du stock tradeit (float exact) qui maximisent le profit moyen, en mélangeant les caisses si ça rapporte plus.
+          Dans une pile, tout est au même prix : on prend toujours ses plus bas floats.
+          Coût = valeur marché de ce que tu cèdes : prix d'échange × ${fmtRate(ri.rate)}
+          ${ri.est ? "<b>(taux estimé</b> : déverrouille ton inventaire pour ton taux réel)" : "(ton taux, items cochés)"}.
+          Résultats revendus aux prix actuels des marchés, frais ${esc(state.fee)} %.</p>
+        <p class="muted small">${stockAge()} · ${num(so.items)} items en stock (${so.hashes} skins et usures) ·
+          <b>${good}</b> caisse${good > 1 ? "s" : ""} sur ${list.length} avec un contrat rentable en moyenne${state.st ? " (StatTrak™)" : ""}${budget ? ", dans ton solde" : ""}.</p></div>
+      <div class="best-list">${ovCard}${cards || `<div class="panel empty">Aucun contrat possible${budget ? " dans ton solde" : ""} avec le stock actuel.</div>`}</div>`;
+  }
+
+  function tiCard(r, i) {
+    const cls = r.profit >= 0 ? "win" : "loss";
+    const trade = r.inputs.reduce((s, x) => s + x.q.trade, 0);
+    const m = engine("market");
+    let mk = 0;
+    for (const x of r.inputs) {
+      const q = m.quote(x.hash);
+      mk = q && mk != null ? mk + q.price : null;
+    }
+    const items = r.inputs.map((x) => `<div class="ti-it${r.case && x.case !== r.case ? " filler" : ""}" title="${esc(x.case)}">
+        ${img(x.img, x.name)}<b>${esc(x.name)}</b><small>${esc(SHORT[x.wear])} · ${x.float.toFixed(4)}</small><small>${money(x.q.trade)}</small></div>`).join("");
+    const col = r.case ? null : catalog.collections.find((c) => c.case === r.cases[0]);
+    const title = r.case
+      ? `${esc(r.case)}${r.fillers ? ` <span class="muted small">+ ${r.fillers} Covert${r.fillers > 1 ? "s" : ""} d'une autre caisse</span>` : ""}`
+      : `Meilleur contrat toutes caisses <span class="muted small">${esc(r.cases.join(" + "))}</span>`;
+    return `<div class="bc ti-c">${img(r.caseImg || (col && col.img), r.case || r.cases[0])}
+      <div><h3>${title}</h3><div class="ti-items">${items}</div>
+        <div class="meta-row">
+          <span>échange <b>${money(trade)}</b></span><span>tu cèdes <b>${money(r.cost)}</b></span>
+          <span>au marché <b>${mk != null ? money(mk) : "—"}</b></span><span>valeur moyenne <b>${money(r.ev)}</b></span>
+          <span>rentabilité <b class="${cls}">${pct(r.roi, true)}</b></span><span>chance de profit <b>${pct(r.pWin)}</b></span>
+          <span>meilleur cas <b class="win">${r.best ? signed(r.best.profit) : "—"}</b></span></div>
+        <div class="ti-oc" data-ocbox="${i}" hidden></div></div>
+      <div class="side"><b class="${cls}">${signed(r.profit)}</b><span class="muted small">profit moyen</span>
+        <button type="button" class="btn sm ghost" data-tioc="${i}">Résultats (${r.outcomes.length})</button>
+        <button type="button" class="btn sm" data-tiload="${i}">Ouvrir dans le constructeur</button></div></div>`;
+  }
+  const tiAt = (i) => (i < 0 ? tiList.overall : tiList[i]);
+
+  // ---------------------------------------------- Coverts en stock
+  function tiStock() {
+    if (!stockOffers()) return noStock();
+    const opt = (v, l) => `<option value="${v}"${state.tiStockSort === v ? " selected" : ""}>${l}</option>`;
+    return `<div class="panel"><div class="panel-head"><h2>Coverts en stock chez tradeit${state.st ? " (StatTrak™)" : ""}</h2>
+        <div class="btns"><label>Trier par <select id="ti-ssort">${opt("deal", "Meilleur prix vs marché")}${opt("price", "Prix d'échange")}${opt("float", "Plus bas float (position)")}${opt("stock", "Stock")}</select></label></div></div>
+        <div class="ti-tools"><input id="ti-q" type="search" placeholder="Filtrer : AK-47, Empress, Fracture…" value="${esc(state.tiQ)}" autocomplete="off"></div>
+        <p class="muted small">« Écart » = ce que tu cèdes pour l'avoir en échange, comparé à son prix le plus bas sur les marchés : négatif, l'échange est moins cher qu'un achat.
+          Une pile est au même prix quel que soit le float : ses plus bas floats sont les meilleurs pour un contrat. ${stockAge()}.</p>
+        <p id="ti-msg" class="small win" hidden></p>
+        <div id="ti-stock-table">${stockTable()}</div></div>`;
+  }
+
+  function stockTable() {
+    const so = stockOffers();
+    const ri = rateInfo();
+    const m = engine("market");
+    const q = (state.tiQ || "").trim().toLowerCase();
+    const rows = [];
+    for (const [hash, offers] of Object.entries(so.by)) {
+      const c = covertOf[hash];
+      if (c.st !== state.st) continue;
+      const col = m.caseOf(c.name);
+      if (q && !(hash.toLowerCase().includes(q) || (col && col.case.toLowerCase().includes(q)))) continue;
+      const mq = m.quote(hash);
+      const sk = catalog.coverts[c.name];
+      for (const o of offers) {
+        const eq = ri ? o.trade * ri.rate : null;
+        rows.push({ hash, c, sk, col, o, mq, eq, gap: eq != null && mq ? eq / mq.price - 1 : null,
+                    pos: (o.f[0] - sk.min) / (sk.max - sk.min) });
+      }
+    }
+    const sorters = {
+      deal: (a, b) => (a.gap == null) - (b.gap == null) || a.gap - b.gap,
+      price: (a, b) => a.o.trade - b.o.trade,
+      float: (a, b) => a.pos - b.pos,
+      stock: (a, b) => b.o.n - a.o.n,
+    };
+    rows.sort(sorters[state.tiStockSort] || sorters.deal);
+    if (!rows.length) return `<p class="muted">Aucun Covert en stock ne correspond.</p>`;
+    const shown = rows.slice(0, 200);
+    const body = shown.map((r) => `<tr><td>${img(r.sk.img, r.hash)}</td>
+        <td><b>${esc(r.hash.replace(/ \([^)]*\)$/, ""))}</b><br><span class="muted small">${esc(SHORT[r.c.wear])} · ${esc(r.col ? r.col.case : "")}</span></td>
+        <td class="n">${num(r.o.n)}${r.o.lock ? `<br><span class="muted small">bloqué ${r.o.lock} j</span>` : ""}</td>
+        <td class="n">${money(r.o.trade)}</td><td class="n">${r.eq != null ? money(r.eq) : "—"}</td>
+        <td class="n">${r.mq ? `${money(r.mq.price)}<br>${srcBadge(r.mq, r.hash)}` : "—"}</td>
+        <td class="n ${r.gap == null ? "" : r.gap < 0 ? "win" : r.gap > 0.05 ? "loss" : ""}">${r.gap != null ? pct(r.gap, true) : "—"}</td>
+        <td class="n">${r.o.f.slice(0, 3).map((f) => f.toFixed(4)).join("<br>")}${r.o.n > 3 ? `<br><span class="muted small">… ${r.o.hi.toFixed(4)}</span>` : ""}</td>
+        <td><button type="button" class="btn sm ghost" data-tiadd="${esc(r.hash)}" data-tip="${r.o.trade}" title="Ajouter son plus bas float libre au constructeur">+</button></td></tr>`).join("");
+    return `<div class="scroll"><table class="ti-table"><thead><tr><th></th><th>Covert</th><th class="n">Stock</th><th class="n">Échange</th>
+        <th class="n">Tu cèdes</th><th class="n">Marché</th><th class="n">Écart</th><th class="n">Plus bas floats</th><th></th></tr></thead>
+      <tbody>${body}</tbody></table></div>${rows.length > shown.length ? `<p class="muted small">${shown.length} lignes affichées sur ${rows.length} : filtre pour affiner.</p>` : ""}`;
+  }
+
+  /** met le plus bas float libre d'une pile dans la premiere case vide du constructeur */
+  function addFromStock(hash, trade) {
+    const c = covertOf[hash];
+    const offer = (stockOffers().by[hash] || []).find((o) => o.trade === trade);
+    if (!c || !offer) return "Item introuvable dans le stock.";
+    const used = new Set(state.slots.filter((s) => s && s.ti === trade && s.name === c.name).map((s) => s.float));
+    const f = offer.f.find((x) => !used.has(x));
+    if (f == null) return "Tous les floats relevés de cette pile sont déjà dans le constructeur.";
+    const i = state.slots.findIndex((s) => !s);
+    if (i < 0) return "Le constructeur est plein : retire un Covert d'abord.";
+    state.slots[i] = { name: c.name, wear: c.wear, float: f, price: null, ti: trade };
+    save();
+    return `${c.name} (${SHORT[c.wear]}, float ${f.toFixed(4)}) ajouté à la case ${i + 1} du constructeur.`;
+  }
+
+  // ---------------------------------------------- inventaire
+  function tiInventory(file) {
+    if (!file) return `<div class="panel">${SETUP}</div>`;
+    if (!inv) return `<div class="panel empty">Déverrouille ton inventaire ci-dessus pour le voir.</div>`;
     const rate = tradeRate();
-    const sel = inv.items.filter((it) => !state.tiOff.includes(it.key));
-    const totUser = sel.reduce((s, it) => s + it.user * it.qty, 0);
-    const totMarket = sel.reduce((s, it) => s + it.market * it.qty, 0);
+    const totUser = balance().user;
     const rows = inv.items.map((it) => {
       const on = !state.tiOff.includes(it.key);
       const ratio = it.market > 0 ? it.user / it.market : null;
@@ -562,9 +871,10 @@
         <td class="n ${ratio != null && ratio >= 1.7 ? "win" : ""}">${ratio != null ? "×" + ratio.toLocaleString("fr-FR", { maximumFractionDigits: 2 }) : "—"}</td></tr>`;
     }).join("");
 
-    // contrat du constructeur : marche vs echange
-    const mk = engine("market").evaluate(state.slots.filter(Boolean), { st: state.st });
-    const tiEval = rate ? engine("tradeit").evaluate(state.slots.filter(Boolean), { st: state.st }) : null;
+    // contrat du constructeur : marche vs echange (un item precis du stock garde son prix)
+    const filled = state.slots.filter(Boolean);
+    const mk = engine("market").evaluate(filled.map((s) => Object.assign({}, s, { ti: null })), { st: state.st });
+    const tiEval = rate ? engine("tradeit").evaluate(filled.map((s) => (s.ti != null ? slotInput(s) : s)), { st: state.st }) : null;
     let cmp = "";
     if (mk.complete && mk.cost != null) {
       const tradeUnits = tiEval && tiEval.cost != null ? tiEval.inputs.reduce((s, r) => s + (r.q && r.q.trade != null ? r.q.trade : NaN), 0) : null;
@@ -588,25 +898,24 @@
         <div class="btns" style="margin-top:8px"><button type="button" class="btn sm ghost" data-pay="${state.pay === "tradeit" ? "market" : "tradeit"}">${state.pay === "tradeit" ? "Revenir aux prix du marché" : "Payer les inputs en échange tradeit dans tous les onglets"}</button></div></div>`;
     }
 
-    root.innerHTML = `<div class="kpis">
-        <div class="kpi best"><span>Valeur d'échange tradeit</span><b>${money(totUser)}</b><small>ce que tradeit t'accorde (items cochés)</small></div>
-        <div class="kpi"><span>Valeur marché</span><b>${money(totMarket)}</b><small>mêmes items au prix du marché</small></div>
-        <div class="kpi"><span>Taux</span><b>${rate ? rate.toLocaleString("fr-FR", { maximumFractionDigits: 3 }) : "—"}</b><small>€ de marché cédés par € d'échange</small></div>
-        <div class="kpi"><span>Relevé</span><b>${esc(ago(inv.updated_at))}</b><small>${inv.items.length} types d'items</small></div>
-      </div>${cmp}
+    return `${cmp}
       <div class="panel"><div class="panel-head"><h2>Ton inventaire</h2><button type="button" class="btn sm ghost" id="ti-lock">Verrouiller</button></div>
-        <p class="muted small">Coche les items que tu acceptes d'échanger. Le rapport « échange / marché » montre ce que tradeit t'accorde par rapport au prix du marché, dans sa monnaie d'échange gonflée (≈ ×1,8) : compare les items entre eux, pas à 1.</p>
+        <p class="muted small">Coche les items que tu acceptes d'échanger. Le rapport « échange / marché » montre ce que tradeit t'accorde par rapport au prix du marché, dans sa monnaie d'échange gonflée (≈ ×1,8) : compare les items entre eux, pas à 1.
+          Les mieux valorisés (rapport élevé) sont les plus intéressants à céder.</p>
         <div class="scroll"><table><thead><tr><th></th><th></th><th>Item</th><th class="n">Échange tradeit</th><th class="n">Marché</th><th class="n">Échange / marché</th></tr></thead>
         <tbody>${rows}</tbody></table></div></div>`;
   }
 
   // ========================================================== EVENEMENTS
-  function loadContract(groups) {
-    const slots = [];
-    for (const [name, wear, n] of groups) for (let i = 0; i < n; i++) slots.push({ name, wear, float: null, price: null });
+  function loadSlots(slots) {
     state.slots = slots.slice(0, 5).concat(Array(Math.max(0, 5 - slots.length)).fill(null));
     setTab("builder");
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+  function loadContract(groups) {
+    const slots = [];
+    for (const [name, wear, n] of groups) for (let i = 0; i < n; i++) slots.push({ name, wear, float: null, price: null });
+    loadSlots(slots);
   }
 
   function bind() {
@@ -637,19 +946,55 @@
       if (pay) { state.pay = pay.dataset.pay; engines.clear(); save(); render(); return; }
       const ex = t.closest("[data-ex]");
       if (ex) { state.target = ex.dataset.ex; save(); renderTarget(); return; }
-      if (t.id === "ti-lock") { inv = null; mem.del("invpass"); if (state.pay === "tradeit") state.pay = "market"; engines.clear(); save(); renderTradeit(); }
+      if (t.id === "ti-lock") { inv = null; mem.del("invpass"); if (state.pay === "tradeit") state.pay = "market"; engines.clear(); save(); renderTradeit(); return; }
+
+      // onglet tradeit
+      const tv = t.closest("[data-tiview]");
+      if (tv) { state.tiView = tv.dataset.tiview; save(); renderTradeit(); return; }
+      const oc = t.closest("[data-tioc]");
+      if (oc) {
+        const box = $(`[data-ocbox="${oc.dataset.tioc}"]`);
+        const r = tiList && tiAt(+oc.dataset.tioc);
+        if (!box || !r) return;
+        if (!box.innerHTML) box.innerHTML = `<div class="ocgrid">${ocCards(r.outcomes)}</div>`;
+        box.hidden = !box.hidden;
+        oc.textContent = box.hidden ? `Résultats (${r.outcomes.length})` : "Masquer les résultats";
+        return;
+      }
+      const tl = t.closest("[data-tiload]");
+      if (tl) {
+        const r = tiList && tiAt(+tl.dataset.tiload);
+        if (r) loadSlots(r.inputs.map((x) => ({ name: x.name, wear: x.wear, float: x.float, price: null, ti: x.q.trade })));
+        return;
+      }
+      const ta = t.closest("[data-tiadd]");
+      if (ta) {
+        const msg = $("#ti-msg");
+        msg.textContent = addFromStock(ta.dataset.tiadd, parseFloat(ta.dataset.tip));
+        msg.hidden = false;
+      }
     });
     document.addEventListener("keydown", (e) => {
       const sl = e.target.closest && e.target.closest(".slot.filled");
       if (sl && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openPicker(+sl.dataset.slot); }
     });
     document.addEventListener("change", (e) => {
-      if (e.target.id === "oc-sort") { state.ocSort = e.target.value; save(); renderBuilder(); }
-      if (e.target.dataset && e.target.dataset.tioff != null) {
-        const k = e.target.dataset.tioff;
-        state.tiOff = e.target.checked ? state.tiOff.filter((x) => x !== k) : state.tiOff.concat(k);
+      const t = e.target;
+      if (t.id === "oc-sort") { state.ocSort = t.value; save(); renderBuilder(); }
+      if (t.dataset && t.dataset.tioff != null) {
+        const k = t.dataset.tioff;
+        state.tiOff = t.checked ? state.tiOff.filter((x) => x !== k) : state.tiOff.concat(k);
         engines.clear(); save(); renderTradeit();
       }
+      if (t.id === "ti-mix") { state.tiMix = +t.value; save(); renderTradeit(); }
+      if (t.id === "ti-sort") { state.tiSort = t.value; save(); renderTradeit(); }
+      if (t.id === "ti-budget") { state.tiBudget = t.checked; save(); renderTradeit(); }
+      if (t.id === "ti-ssort") { state.tiStockSort = t.value; save(); $("#ti-stock-table").innerHTML = stockTable(); }
+    });
+    document.addEventListener("input", (e) => {
+      if (e.target.id !== "ti-q") return;
+      state.tiQ = e.target.value; save();
+      $("#ti-stock-table").innerHTML = stockTable();
     });
     document.addEventListener("submit", async (e) => {
       if (e.target.id !== "ti-unlock") return;
@@ -663,7 +1008,7 @@
     $("#b-dup").addEventListener("click", () => {
       const last = state.slots.filter(Boolean).pop();
       if (!last) return;
-      state.slots = state.slots.map((s) => s || Object.assign({}, last));
+      fillEmpty(last);
       save(); renderBuilder();
     });
 
@@ -675,21 +1020,28 @@
     $("#pk-list").addEventListener("click", (e) => {
       const it = e.target.closest("[data-pick]");
       if (!it) return;
-      pk.name = it.dataset.pick; pk.wear = null; pk.float = ""; pk.price = "";
+      pk.name = it.dataset.pick; pk.wear = null; pk.float = ""; pk.price = ""; pk.ti = null;
       $$(".pk-item", $("#pk-list")).forEach((x) => x.classList.toggle("sel", x === it));
       renderPickerDetail();
     });
     $("#pk-detail").addEventListener("click", (e) => {
+      const fl = e.target.closest("[data-tif]");
+      if (fl) {                                   // un item precis du stock tradeit
+        pk.wear = fl.dataset.tiw; pk.float = parseFloat(fl.dataset.tif); pk.ti = parseFloat(fl.dataset.tip); pk.price = "";
+        renderPickerDetail(); return;
+      }
       const w = e.target.closest("[data-wear]");
       if (w) {
         const v = pickerValue();
-        pk.wear = w.dataset.wear; pk.float = v.float == null ? "" : v.float; pk.price = v.price == null ? "" : v.price;
+        // le float d'un item tradeit appartient a son usure : on le lache en changeant d'usure
+        const keep = v.ti == null;
+        pk.wear = w.dataset.wear; pk.float = keep && v.float != null ? v.float : ""; pk.price = v.price == null ? "" : v.price; pk.ti = null;
         renderPickerDetail(); return;
       }
       if (e.target.id === "pk-put" || e.target.id === "pk-fill") {
         const v = pickerValue();
         state.slots[pk.slot] = v;
-        if (e.target.id === "pk-fill") state.slots = state.slots.map((s) => s || Object.assign({}, v));
+        if (e.target.id === "pk-fill") fillEmpty(v);
         save(); closePicker(); renderBuilder();
       }
     });
@@ -719,14 +1071,21 @@
 
   async function boot() {
     try {
-      const [c, p] = await Promise.all([
+      const [c, p, t] = await Promise.all([
         fetch("data/catalog.json").then((r) => r.json()),
         fetch("data/prices.json", { cache: "no-store" }).then((r) => r.json()),
+        // stock tradeit : facultatif, le site marche sans
+        fetch("data/tradeit.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
       ]);
-      catalog = c; prices = p;
+      catalog = c; prices = p; stockRaw = t;
     } catch (e) {
       $("#b-result").innerHTML = `<div class="panel empty">Impossible de charger les données (${esc(e.message)}).</div>`;
       return;
+    }
+    for (const [name, sk] of Object.entries(catalog.coverts)) {
+      for (const st of sk.st ? [false, true] : [false]) {
+        for (const wear of sk.wears) covertOf[TradeupEngine.hashName(name, wear, st)] = { name, wear, st };
+      }
     }
     // un contrat partage par lien (#c=nom~usure,...) remplace les cases
     const h = new URLSearchParams(location.hash.slice(1));

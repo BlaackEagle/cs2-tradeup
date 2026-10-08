@@ -123,9 +123,31 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   await p.waitForTimeout(200);
   check("meilleur contrat -> constructeur", (await p.$$eval("#slots .slot.filled", (x) => x.length)) === 5);
 
-  // ------------------------------------------------------- inventaire tradeit
+  // ---------------------------------------------------------------- tradeit
   await p.click('.tabs [data-tab="tradeit"]');
-  await p.waitForSelector("#ti-root .panel");
+  await p.waitForSelector("#ti-root .ti-seg");
+  const hasStock = !!(await p.$("#ti-root .ti-c"));
+  const tiText = await text(p, "#ti-root");
+  check("tradeit : contrats sur le stock, ou stock pas encore releve", hasStock || /pas encore relevé/.test(tiText), tiText.slice(0, 100));
+  const money = (s) => parseFloat(s.replace(/[^\d,−-]/g, "").replace("−", "-").replace(",", "."));
+  if (hasStock) {
+    const cards = await p.$$eval("#ti-root .ti-c", (x) => x.map((c) => c.querySelectorAll(".ti-it").length));
+    check("contrats du stock : 5 items precis chacun", cards.length >= 5 && cards.every((n) => n === 5), `${cards.length} contrats`);
+    if (!pass) check("sans inventaire : taux estime annonce", /taux estimé/.test(tiText));
+    const profits = await p.$$eval("#ti-root .ti-c .side b", (x) => x.map((e) => e.innerText));
+    check("contrats du stock tries par profit", profits.map(money).every((v, i, a) => i === 0 || v <= a[i - 1] + 1e-9), profits.slice(0, 3).join(" "));
+    await p.click("#ti-root [data-tioc]");
+    await p.waitForTimeout(100);
+    check("resultats d'un contrat du stock", (await p.$$eval("#ti-root .ti-oc:not([hidden]) .oc", (x) => x.length)) > 0);
+    await p.selectOption("#ti-mix", "0");
+    await p.waitForTimeout(300);
+    const fillers = await p.$$eval("#ti-root .ti-c .ti-it.filler", (x) => x.length);
+    check("composition 100 % une caisse : aucun complement", fillers === 0, `${fillers} complements`);
+    await p.selectOption("#ti-mix", "2");
+    await p.waitForTimeout(300);
+    await p.screenshot({ path: path.join(out, "tradeit-contrats.png"), fullPage: false });
+  }
+
   if (pass) {
     check("inventaire chiffre : formulaire de deverrouillage", !!(await p.$("#ti-unlock")));
     await p.fill("#ti-pass", "mauvaise");
@@ -134,6 +156,9 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     check("mauvaise phrase refusee", /incorrecte/.test(await text(p, "#ti-err")));
     await p.fill("#ti-pass", pass);
     await p.click('#ti-unlock button[type="submit"]');
+    await p.waitForSelector("#ti-root .kpi", { timeout: 10000 });
+    if (hasStock) check("inventaire deverrouille : ton taux", /ton taux/.test(await text(p, "#ti-root")));
+    await p.click('#ti-root [data-tiview="inv"]');
     await p.waitForSelector("#ti-root table", { timeout: 10000 });
     const rows = await p.$$eval("#ti-root tbody tr", (x) => x.length);
     check("inventaire dechiffre : 3 items", rows === 3, `${rows} lignes`);
@@ -157,6 +182,66 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     check("onglet tradeit : instructions ou deverrouillage", /STEAM_ID/.test(t) || !!(await p.$("#ti-unlock")), t.slice(0, 90));
   }
 
+  if (hasStock) {
+    // un contrat du stock dans le constructeur : memes items, meme cout
+    await p.click('#ti-root [data-tiview="contracts"]');
+    await p.waitForSelector("#ti-root .best-list");
+    if (await p.$("#ti-budget")) {
+      // inventaire deverrouille : par defaut, seulement les contrats dans le solde
+      const bal = money(await text(p, "#ti-root .kpi:first-child b"));
+      const trades = await p.$$eval("#ti-root .ti-c .meta-row span:first-child b", (x) => x.map((e) => e.innerText));
+      check("dans mon solde : contrats financables", trades.map(money).every((v) => v <= bal + 0.01), `${trades.length} contrats, solde ${bal}`);
+      if (await p.isChecked("#ti-budget")) { await p.uncheck("#ti-budget"); await p.waitForTimeout(300); }
+    }
+    await p.waitForSelector("#ti-root .ti-c");
+    const cede = await text(p, "#ti-root .ti-c .meta-row span:nth-child(2) b");
+    const fl = await p.$$eval("#ti-root .ti-c:first-of-type .ti-it small:first-of-type", (x) => x.map((e) => e.innerText.split("· ")[1]));
+    await p.click("#ti-root .ti-c [data-tiload]");
+    await p.waitForSelector("#slots .slot.filled");
+    await p.waitForTimeout(200);
+    check("contrat du stock -> constructeur : 5 items tradeit", (await p.$$eval("#slots .src.ti", (x) => x.length)) === 5);
+    const slotsTxt = await text(p, "#slots");
+    check("floats exacts du stock repris", fl.length === 5 && fl.every((f) => slotsTxt.includes(f)), fl.join(" "));
+    const kc = await text(p, ".kpi:first-child b");
+    check("cout du constructeur = ce que tu cedes", Math.abs(money(kc) - money(cede)) < 0.011, `${kc} vs ${cede}`);
+
+    // Coverts en stock : tableau, filtre, ajout au constructeur
+    await p.click("#b-clear");
+    await p.click('.tabs [data-tab="tradeit"]');
+    await p.click('#ti-root [data-tiview="stock"]');
+    await p.waitForSelector("#ti-stock-table tbody tr");
+    const nrows = await p.$$eval("#ti-stock-table tbody tr", (x) => x.length);
+    check("Coverts en stock : tableau", nrows > 10, `${nrows} lignes`);
+    await p.fill("#ti-q", "Empress");
+    await p.waitForTimeout(150);
+    const names = await p.$$eval("#ti-stock-table tbody td:nth-child(2) b", (x) => x.map((e) => e.innerText));
+    check("filtre « Empress »", names.length > 0 && names.every((n) => /Empress/.test(n)), names.slice(0, 2).join(", "));
+    await p.click("#ti-stock-table [data-tiadd]");
+    check("ajout au constructeur", /case 1/.test(await text(p, "#ti-msg")), await text(p, "#ti-msg"));
+    await p.screenshot({ path: path.join(out, "tradeit-stock.png"), fullPage: false });
+    await p.click('.tabs [data-tab="builder"]');
+    await p.waitForTimeout(150);
+    check("item du stock dans la case 1", !!(await p.$('#slots [data-slot="0"] .src.ti')));
+
+    // selecteur : choisir un float precis du stock
+    await p.click('#slots [data-slot="1"]');
+    await p.waitForSelector("#picker[open]");
+    await p.fill("#pk-q", "Empress");
+    await p.waitForTimeout(100);
+    await p.click('#pk-list [data-pick="AK-47 | The Empress"]');
+    const offers = await p.$$eval("#pk-detail .pk-offer", (x) => x.length);
+    check("selecteur : stock tradeit du Covert", offers > 0, `${offers} piles`);
+    if (offers) {
+      const f = await text(p, "#pk-detail .pk-offer .fl");
+      await p.click("#pk-detail .pk-offer .fl");
+      check("selecteur : item tradeit choisi", (await text(p, "#pk-detail .ti-pick")).includes(f), f);
+      await p.click("#pk-put");
+      await p.waitForTimeout(150);
+      const s = await text(p, '#slots [data-slot="1"]');
+      check("case 2 : float et prix tradeit", s.includes(f) && /tradeit/.test(s), s);
+    }
+  }
+
   // ------------------------------------------------------------------ mobile
   const m = await page({ width: 390, height: 844 });
   await m.goto(url, { waitUntil: "networkidle" });
@@ -164,6 +249,12 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   const overflow = await m.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   check("mobile : pas de scroll horizontal", overflow <= 0, `debordement ${overflow}px`);
   await m.screenshot({ path: path.join(out, "mobile.png"), fullPage: true });
+  await m.click('.tabs [data-tab="tradeit"]');
+  await m.waitForSelector("#ti-root .ti-seg");
+  await m.waitForTimeout(300);
+  const overflowTi = await m.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  check("mobile tradeit : pas de scroll horizontal", overflowTi <= 0, `debordement ${overflowTi}px`);
+  await m.screenshot({ path: path.join(out, "mobile-tradeit.png"), fullPage: false });
 
   await browser.close();
   check("aucune erreur JavaScript", errors.length === 0, errors.slice(0, 3).join(" || "));

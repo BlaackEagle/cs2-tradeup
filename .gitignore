@@ -3,3 +3,4 @@ __pycache__/
 node_modules/
 tests/*.out
 site/data/inventory.enc.json
+site/data/tradeit.json
