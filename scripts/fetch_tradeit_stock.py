@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
 Stock de Coverts de la boutique d'echange tradeit.gg, item par item, dans
-site/data/tradeit.json : float exact et prix d'echange de chaque exemplaire.
+site/data/tradeit.json : prix d'echange, nombre d'exemplaires et float exact
+de chaque exemplaire.
 
-La recherche par nom donne une ligne par pile (groupId), toute la pile au
-meme prix. On ouvre chaque pile pour lire le float de chaque exemplaire :
-le prix ne dependant pas du float, le plus bas float d'une pile ne coute pas
-plus cher que le plus haut.
-
-Par pile on garde ses KEEP floats les plus bas (un contrat prend au plus 5
-items : au-dela, un exemplaire plus haut au meme prix ne sert jamais), le
-nombre d'exemplaires et le float le plus haut. Prix en centimes de dollar,
-dans la monnaie d'echange de tradeit.
+tradeit limite le debit (environ 30 requetes par minute) : une requete
+toutes les PACE secondes, et un releve incremental dans un budget de temps.
+ 1. Recherche par Covert (toutes usures, StatTrak compris) : les piles en
+    stock (groupId), leur prix d'echange et leur nombre d'exemplaires. Les
+    Coverts les moins recemment cherches d'abord ; les autres gardent leur
+    releve precedent (12 h au plus).
+ 2. Ouverture des piles : le float de chaque exemplaire. D'abord les piles
+    jamais ouvertes, puis celles dont le stock a change, puis les plus
+    anciennes. Les autres gardent leurs floats precedents, avec leur date.
+Toute une pile est au meme prix : son plus bas float ne coute pas plus cher.
+On garde par pile ses KEEP plus bas floats (un contrat en prend au plus 5).
 
 Donnees publiques de la boutique, lues sans connexion : rien de personnel.
-Si le releve echoue, le fichier precedent est garde tant qu'il a moins de
-12 h, puis supprime (mieux vaut pas de stock qu'un stock perime).
+Si le releve echoue entierement, le fichier precedent est garde tant qu'il
+a moins de 12 h, puis supprime.
 
     python scripts/fetch_tradeit_stock.py
 """
@@ -23,60 +26,76 @@ Si le releve echoue, le fichier precedent est garde tant qu'il a moins de
 import json
 import os
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fetch_prices import CATALOG, MAX_CARRY_H, SourceError, age_h, http, log, now  # noqa: E402
+from fetch_prices import CATALOG, MAX_CARRY_H, UA, SourceError, age_h, log, now  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "site", "data", "tradeit.json")
 API = os.environ.get("TRADEIT_API", "https://tradeit.gg/api/v2/inventory/data")   # faux serveur en test
-HEADERS = {"Referer": "https://tradeit.gg/csgo/trade"}
-KEEP = 8                    # floats gardes par pile
-WORKERS = 3
-PAUSE = 0.3                 # entre deux requetes d'un meme fil
-BUDGET_S = 8 * 60           # au-dela, on publie ce qu'on a (releve partiel)
-SAMPLES = ["AK-47 | The Empress (Field-Tested)", "M4A4 | Temukau (Field-Tested)",
-           "StatTrak™ AK-47 | The Empress (Battle-Scarred)"]
+HEADERS = {"User-Agent": UA, "Accept": "application/json", "Referer": "https://tradeit.gg/csgo/trade"}
+KEEP = 8                                                     # floats gardes par pile
+PACE = float(os.environ.get("TRADEIT_PACE", 2.3))            # secondes entre deux requetes
+BUDGET_S = float(os.environ.get("TRADEIT_BUDGET", 8 * 60))   # duree max du releve
+SEARCH_SHARE = 0.5           # part du budget au plus pour les recherches quand un releve precedent existe
+SAMPLES = ["AK-47 | The Empress (Field-Tested)", "M4A4 | Temukau (Field-Tested)"]
+
+
+class RateLimited(Exception):
+    pass
+
+
+class Api:
+    """Requetes espacees de PACE secondes ; 429 : pause croissante, puis abandon."""
+
+    def __init__(self):
+        self.last = 0.0
+        self.calls = self.n429 = self.streak = 0
+
+    def get(self, params):
+        err = None
+        for attempt in range(3):
+            wait = self.last + PACE - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self.last = time.time()
+            try:
+                r = requests.get(API, params=dict({"gameId": 730}, **params), headers=HEADERS, timeout=40)
+            except requests.RequestException as e:
+                err = type(e).__name__
+                time.sleep(5)
+                continue
+            self.calls += 1
+            if r.status_code == 429 or r.status_code >= 500:
+                err = f"HTTP {r.status_code}"
+                if r.status_code == 429:
+                    self.n429 += 1
+                    self.streak += 1
+                    if self.streak >= 3:
+                        raise RateLimited(f"{self.streak} refus HTTP 429 de suite")
+                time.sleep(20 * (attempt + 1))
+                continue
+            self.streak = 0
+            if r.status_code != 200:
+                raise SourceError(f"HTTP {r.status_code}")
+            try:
+                return r.json()
+            except ValueError:
+                raise SourceError("reponse illisible")
+        raise SourceError(err or "echec reseau")
 
 
 def covert_names(catalog):
-    names = set()
+    names = {}
     for name, c in catalog["coverts"].items():
         for w in c["wears"]:
-            names.add(f"{name} ({w})")
+            names[f"{name} ({w})"] = name
             if c["st"]:
-                names.add(f"StatTrak™ {name} ({w})")
+                names[f"StatTrak™ {name} ({w})"] = name
     return names
-
-
-def get(params):
-    r = http("GET", API, retries=4, params=dict({"gameId": 730}, **params), headers=HEADERS, timeout=40)
-    if r.status_code != 200:
-        raise SourceError(f"HTTP {r.status_code}")
-    time.sleep(PAUSE)
-    return r.json()
-
-
-def search(base_name):
-    """Lignes de la boutique pour un Covert (toutes usures, StatTrak compris)."""
-    d = get({"offset": 0, "limit": 200, "searchValue": base_name})
-    counts = d.get("counts") or {}
-    return [(it, counts.get(str(it.get("groupId")))) for it in d.get("items") or []]
-
-
-def open_group(gid):
-    """Tous les exemplaires d'une pile."""
-    out, offset = [], 0
-    while True:
-        d = get({"groupId": gid, "offset": offset, "limit": 500, "fresh": "true", "isForStore": 0})
-        items = d.get("items") or []
-        out.extend(items)
-        if len(items) < 500:
-            return out
-        offset += 500
 
 
 def price_of(it):
@@ -84,108 +103,164 @@ def price_of(it):
     return int(p) if p else None
 
 
+def load_previous():
+    try:
+        with open(OUT, encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if old.get("v") != 2 or age_h(old.get("updated_at")) > MAX_CARRY_H:
+        return None
+    return old
+
+
 def main():
     with open(CATALOG, encoding="utf-8") as f:
         catalog = json.load(f)
-    names = covert_names(catalog)
+    names = covert_names(catalog)                   # market_hash_name -> Covert
     t0 = time.time()
-    lock = threading.Lock()
-    errors = []
+    api = Api()
+    prev = load_previous()
+    stamp = now()
 
-    # 1. recherche de chaque Covert : les piles en stock
-    groups, singles = {}, []          # groupId -> (nom, prix, nombre annonce) ; items deja unitaires
-    with ThreadPoolExecutor(WORKERS) as ex:
-        futs = {ex.submit(search, n): n for n in sorted(catalog["coverts"])}
-        for fu in as_completed(futs):
-            try:
-                rows = fu.result()
-            except Exception as e:                          # noqa: BLE001
-                errors.append(f"recherche : {e}")
+    # offres precedentes, par Covert : elles restent tant que le Covert n'est pas recherche
+    prev_offers, searched = {}, {}
+    if prev:
+        for hash_name, offers in (prev.get("items") or {}).items():
+            if hash_name in names:
+                prev_offers.setdefault(names[hash_name], {})[hash_name] = offers
+        searched = {k: v for k, v in (prev.get("searched") or {}).items() if age_h(v) <= MAX_CARRY_H}
+    prev_by_group = {o["g"]: o for by in prev_offers.values() for offers in by.values()
+                     for o in offers if o.get("g") is not None}
+
+    # 1. recherches : Coverts jamais cherches ou les plus anciens d'abord
+    order = sorted(catalog["coverts"], key=lambda n: (n in searched, searched.get(n, "")))
+    search_budget = BUDGET_S * (SEARCH_SHARE if prev else 0.75)
+    found, stopped, errors = {}, None, []          # Covert -> {hash: [lignes]}
+    for base in order:
+        if time.time() - t0 > search_budget and base in searched:
+            break
+        try:
+            d = api.get({"offset": 0, "limit": 200, "searchValue": base})
+        except RateLimited as e:
+            stopped = str(e)
+            break
+        except SourceError as e:
+            errors.append(f"recherche : {e}")
+            continue
+        counts = d.get("counts") or {}
+        rows = {}
+        for it in d.get("items") or []:
+            h, p = it.get("name"), price_of(it)
+            if names.get(h) != base or not p:
                 continue
-            for it, count in rows:
-                name, p = it.get("name"), price_of(it)
-                if name not in names or not p:
-                    continue
-                if it.get("assetId") is not None and it.get("floatValue") is not None:
-                    singles.append(it)                      # ligne = un seul exemplaire
-                elif it.get("groupId") is not None:
-                    groups[it["groupId"]] = (name, p, count)
-    if len(errors) > len(catalog["coverts"]) // 2:
-        raise SourceError(f"recherche impossible ({errors[0]})")
-    log(f"[stock] {len(groups)} piles et {len(singles)} items isoles a ouvrir "
-        f"({len(errors)} recherches en echec, {time.time() - t0:.0f}s)")
+            rows.setdefault(h, []).append((it, counts.get(str(it.get("groupId")))))
+        found[base] = rows
+        searched[base] = stamp
+    log(f"[stock] {len(found)} Coverts cherches sur {len(catalog['coverts'])} en {time.time() - t0:.0f}s"
+        + (f" -- arret : {stopped}" if stopped else ""))
 
-    # 2. ouverture des piles : float de chaque exemplaire
-    found = {gid: [] for gid in groups}
-    opened, late = 0, 0
-    with ThreadPoolExecutor(WORKERS) as ex:
-        futs = {}
-        for gid in groups:
-            futs[ex.submit(lambda g: [] if time.time() - t0 > BUDGET_S else open_group(g), gid)] = gid
-        for fu in as_completed(futs):
-            gid = futs[fu]
-            try:
-                items = fu.result()
-            except Exception as e:                          # noqa: BLE001
-                errors.append(f"pile : {e}")
-                continue
-            if not items and time.time() - t0 > BUDGET_S:
-                late += 1
-                continue
-            with lock:
-                found[gid] = items
-                opened += 1
+    # offres a jour : celles des Coverts cherches, sinon les precedentes
+    offers = {}                                    # hash -> [offre]
+    for base in catalog["coverts"]:
+        if base in found:
+            for h, rows in found[base].items():
+                for it, count in rows:
+                    p = price_of(it)
+                    lock = int(it.get("tradeLockDay") or 0)
+                    if it.get("assetId") is not None and it.get("floatValue") is not None:
+                        # exemplaire seul : son float arrive avec la recherche
+                        same = next((o for o in offers.get(h, []) if o.get("g") is None and o["p"] == p), None)
+                        f = round(float(it["floatValue"]), 10)
+                        if same:
+                            same["n"] += 1
+                            same["fn"] += 1
+                            same["f"] = sorted(same["f"] + [f])[:KEEP]
+                            same["hi"] = max(same["hi"], f)
+                        else:
+                            offers.setdefault(h, []).append({"g": None, "p": p, "n": 1, "f": [f], "hi": f,
+                                                             "at": stamp, "fn": 1, "lock": lock})
+                        continue
+                    gid = it.get("groupId")
+                    if gid is None:
+                        continue
+                    old = prev_by_group.get(gid) or {}
+                    o = {"g": gid, "p": p, "n": int(count or old.get("n") or 1), "f": old.get("f") or [],
+                         "hi": old.get("hi"), "at": old.get("at"), "fn": old.get("fn"), "lock": old.get("lock", lock)}
+                    if o["at"] and age_h(o["at"]) > MAX_CARRY_H:
+                        o.update(f=[], hi=None, at=None, fn=None)
+                    offers.setdefault(h, []).append(o)
+        elif base in searched:
+            for h, olds in prev_offers.get(base, {}).items():
+                offers[h] = [dict(o) for o in olds]
 
-    # 3. regroupement par market_hash_name puis par (prix, blocage)
-    stock = {}
-    seen = 0
+    # 2. ouverture des piles, les plus utiles d'abord
+    groups = [o for os_ in offers.values() for o in os_ if o.get("g") is not None]
 
-    def add(name, f, p, lock_days):
-        stock.setdefault(name, {}).setdefault((p, lock_days), []).append(f)
-
-    for gid, items in found.items():
-        name = groups[gid][0]
-        for it in items:
-            f, p = it.get("floatValue"), price_of(it)
-            if it.get("name") not in (None, name) or f is None or not p:
-                continue
-            add(name, float(f), p, int(it.get("tradeLockDay") or 0))
-            seen += 1
-    for it in singles:
-        add(it["name"], float(it["floatValue"]), price_of(it), int(it.get("tradeLockDay") or 0))
-        seen += 1
+    def priority(o):
+        if not o.get("f"):
+            return (0, "")                         # jamais ouverte (ou floats trop vieux)
+        if o.get("fn") != o["n"]:
+            return (1, o.get("at") or "")          # stock change depuis l'ouverture
+        return (2, o.get("at") or "")              # la plus ancienne d'abord
+    groups.sort(key=priority)
+    opened = 0
+    for o in groups:
+        if stopped or time.time() - t0 > BUDGET_S:
+            break
+        try:
+            d = api.get({"groupId": o["g"], "offset": 0, "limit": 500, "fresh": "true", "isForStore": 0})
+        except RateLimited as e:
+            stopped = str(e)
+            break
+        except SourceError as e:
+            errors.append(f"pile : {e}")
+            continue
+        items = [it for it in d.get("items") or [] if it.get("floatValue") is not None]
+        fl = sorted(float(it["floatValue"]) for it in items)
+        opened += 1
+        if not fl:                                 # pile vendue entre-temps
+            o["n"] = 0
+            continue
+        o.update(f=[round(x, 10) for x in fl[:KEEP]], hi=round(fl[-1], 10), at=stamp, fn=len(fl), n=len(fl),
+                 lock=max(int(it.get("tradeLockDay") or 0) for it in items))
+        p = price_of(items[0])
+        if p:
+            o["p"] = p
 
     items = {}
-    for name in sorted(stock):
-        offers = []
-        for (p, lock_days), fl in sorted(stock[name].items()):
-            fl.sort()
-            o = {"p": p, "n": len(fl), "f": [round(x, 10) for x in fl[:KEEP]], "hi": round(fl[-1], 10)}
-            if lock_days:
-                o["lock"] = lock_days
-            offers.append(o)
-        items[name] = offers
+    for h in sorted(offers):
+        keep = sorted((o for o in offers[h] if o["n"] > 0), key=lambda o: o["p"])
+        for o in keep:
+            if not o.get("lock"):
+                o.pop("lock", None)
+        if keep:
+            items[h] = keep
     if not items:
-        raise SourceError("aucun item en stock lu")
+        raise SourceError(stopped or (errors[0] if errors else "aucun Covert en stock lu"))
 
-    complete = opened == len(groups) and not errors
-    out = {
-        "updated_at": now(), "currency": "USD", "unit": "cents", "keep": KEEP,
-        "complete": complete, "groups": len(groups), "opened": opened,
-        "count": seen, "items": items,
+    all_groups = [o for os_ in items.values() for o in os_]
+    with_floats = sum(1 for o in all_groups if o["f"])
+    stats = {
+        "coverts": len(catalog["coverts"]), "searched": len(found), "offers": len(all_groups),
+        "with_floats": with_floats, "opened": opened, "items": sum(o["n"] for o in all_groups),
+        "requests": api.calls, "http429": api.n429, "errors": len(errors),
+        "complete": with_floats == len(all_groups) and len(found) == len(catalog["coverts"]),
     }
+    out = {"v": 2, "updated_at": stamp, "currency": "USD", "unit": "cents", "keep": KEEP,
+           "searched": searched, "stats": stats, "items": items}
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
 
-    log(f"[stock] {seen} items lus dans {opened}/{len(groups)} piles, {len(items)} Coverts en stock "
-        f"-> {os.path.getsize(OUT) // 1024} Ko en {time.time() - t0:.0f}s"
-        + ("" if complete else f" -- PARTIEL ({late} piles hors budget, {len(errors)} erreurs)"))
+    log(f"[stock] {opened} piles ouvertes ; floats connus pour {with_floats}/{len(all_groups)} piles, "
+        f"{stats['items']} items en stock, {len(items)} skins et usures -> {os.path.getsize(OUT) // 1024} Ko "
+        f"en {time.time() - t0:.0f}s ({api.calls} requetes, {api.n429} HTTP 429, {len(errors)} erreurs)")
     for e in errors[:3]:
         log(f"  erreur : {e}")
     for n in SAMPLES:
         for o in items.get(n, []):
-            log(f"  {n:<48} {o['n']:>3} en stock a {o['p'] / 100:.2f} $ d'echange, "
-                f"floats {o['f'][0]:.4f} -> {o['hi']:.4f}" + (f", bloque {o['lock']} j" if o.get("lock") else ""))
+            fl = f"floats {o['f'][0]:.4f} -> {o['hi']:.4f}" if o["f"] else "floats pas encore lus"
+            log(f"  {n:<40} {o['n']:>3} en stock a {o['p'] / 100:.2f} $ d'echange, {fl}")
     return 0
 
 

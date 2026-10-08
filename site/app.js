@@ -118,11 +118,13 @@
     return u > 0 ? m / u : null;
   }
 
+  /** pile la moins chere du stock tradeit, payee en echange au taux de ton inventaire */
   function tradeitQuote(hash) {
-    const it = prices.items[hash];
     const rate = tradeRate();
-    if (!it || !it.tt || !rate) return null;
-    return { price: it.tt[0] * rate, src: "ti", qty: it.tt[1], trade: it.tt[0], stale: false };
+    const so = stockOffers();
+    const offers = so && so.by[hash];
+    if (!offers || !offers.length || !rate) return null;
+    return { price: offers[0].trade * rate, src: "ti", qty: offers.reduce((s, o) => s + o.n, 0), trade: offers[0].trade, stale: false };
   }
 
   /** items coches de l'inventaire : valeur d'echange et valeur marche */
@@ -141,16 +143,19 @@
     if (!stockRaw || !stockRaw.items) return null;
     if (!stockCache) {
       const by = {}, listings = {};
-      let items = 0;
+      let items = 0, piles = 0, known = 0;
       for (const [hash, offers] of Object.entries(stockRaw.items)) {
         if (!covertOf[hash] || !Array.isArray(offers)) continue;
-        by[hash] = offers.filter((o) => o.p > 0 && o.f && o.f.length)
-          .map((o) => ({ trade: usdToBase(o.p / 100), n: o.n, f: o.f, hi: o.hi, lock: o.lock || 0 }))
+        // une pile dont les floats ne sont pas encore lus reste visible (prix, stock),
+        // mais seuls les items de float connu entrent dans les contrats
+        by[hash] = offers.filter((o) => o.p > 0 && o.n > 0)
+          .map((o) => ({ trade: usdToBase(o.p / 100), n: o.n, f: o.f || [], hi: o.hi, lock: o.lock || 0, at: o.at || null }))
           .sort((a, b) => a.trade - b.trade);
+        if (!by[hash].length) { delete by[hash]; continue; }
         listings[hash] = by[hash].flatMap((o) => o.f.map((f) => [f, o.trade]));
-        items += by[hash].reduce((s, o) => s + o.n, 0);
+        for (const o of by[hash]) { items += o.n; piles++; if (o.f.length) known++; }
       }
-      stockCache = { by, listings, items, hashes: Object.keys(by).length };
+      stockCache = { by, listings, items, piles, known, hashes: Object.keys(by).length };
     }
     return stockCache;
   }
@@ -166,16 +171,9 @@
     if (estMemo && estMemo.key === key) return estMemo.v;
     const m = engine("market"), r = [];
     const so = stockOffers();
-    if (so) {
-      for (const [hash, offers] of Object.entries(so.by)) {
-        const q = m.quote(hash);
-        if (q && q.price >= 1 && offers.length) r.push(offers[0].trade / q.price);
-      }
-    } else {
-      for (const [hash, it] of Object.entries(prices.items)) {
-        const q = it.tt ? m.quote(hash) : null;
-        if (q && q.price >= 1) r.push(it.tt[0] / q.price);
-      }
+    for (const [hash, offers] of Object.entries(so ? so.by : {})) {
+      const q = m.quote(hash);
+      if (q && q.price >= 1) r.push(offers[0].trade / q.price);
     }
     r.sort((a, b) => a - b);
     const v = r.length >= 10 ? 1 / (USER_SHARE * r[r.length >> 1]) : null;
@@ -393,7 +391,7 @@
     renderPickerDetail();
     const d = $("#picker");
     if (typeof d.showModal === "function") d.showModal(); else d.setAttribute("open", "");
-    setTimeout(() => $("#pk-q").focus(), 30);
+    $("#pk-q").focus();               // tout de suite : une saisie rapide ne doit pas changer de champ
   }
   function closePicker() {
     const d = $("#picker");
@@ -499,9 +497,11 @@
           const sel = pk.ti === o.trade && pk.float !== "" && Math.abs(+pk.float - f) < 1e-12;
           return `<button type="button" class="fl${sel ? " sel" : ""}" data-tif="${f}" data-tiw="${esc(w)}" data-tip="${o.trade}">${f.toFixed(4)}</button>`;
         }).join("");
-        rows.push(`<div class="pk-offer"><div><b>${esc(SHORT[w])}</b><span class="muted small">${o.n} en stock${o.lock ? ` · bloqué ${o.lock} j` : ""}</span>
+        const more = !o.f.length ? `<span class="muted small">floats pas encore relevés</span>`
+          : o.n > o.f.length ? `<span class="muted small">+ ${o.n - o.f.length} jusqu'à ${o.hi.toFixed(4)}</span>` : "";
+        rows.push(`<div class="pk-offer"><div><b>${esc(SHORT[w])}</b><span class="muted small">${o.n} en stock${o.lock ? ` · bloqué ${o.lock} j` : ""}${floatAge(o)}</span>
             <span class="p">${money(o.trade)} <small class="muted">d'échange${ri ? ` ≈ ${money(o.trade * ri.rate)}` : ""}</small></span></div>
-          <div class="fls">${btns}${o.n > o.f.length ? `<span class="muted small">+ ${o.n - o.f.length} jusqu'à ${o.hi.toFixed(4)}</span>` : ""}</div></div>`);
+          <div class="fls">${btns}${more}</div></div>`);
       }
     }
     return `<div class="pk-stock"><span class="muted small">Stock tradeit${ri && ri.est ? " (≈ € cédés au taux estimé)" : ""} : même prix pour toute une pile, prends le plus bas float.</span>
@@ -710,8 +710,16 @@
   const noStock = () => `<div class="panel empty">Le stock tradeit n'est pas encore relevé : il l'est automatiquement toutes les 30 minutes, item par item.</div>`;
   function stockAge() {
     const h = stockRaw && stockRaw.updated_at ? (Date.now() - new Date(stockRaw.updated_at)) / 3600000 : Infinity;
-    return `Stock relevé ${esc(ago(stockRaw.updated_at))}${stockRaw.complete === false ? " (relevé partiel)" : ""}` +
+    const so = stockOffers();
+    const cov = so && so.known < so.piles ? ` ; floats lus pour ${num(so.known)} piles sur ${num(so.piles)}, le reste suit aux prochains relevés` : "";
+    return `Stock relevé ${esc(ago(stockRaw.updated_at))}${cov}` +
       (h > 2 ? ` <b class="loss">— ancien, des items ont pu partir</b>` : "");
+  }
+  /** floats d'une pile relevés il y a longtemps : le dire */
+  function floatAge(o) {
+    if (!o.at || !o.f.length) return "";
+    const h = (Date.now() - new Date(o.at)) / 3600000;
+    return h >= 1 ? ` · floats lus ${esc(ago(o.at))}` : "";
   }
 
   // ---------------------------------------------- contrats sur le stock
@@ -816,7 +824,7 @@
       for (const o of offers) {
         const eq = ri ? o.trade * ri.rate : null;
         rows.push({ hash, c, sk, col, o, mq, eq, gap: eq != null && mq ? eq / mq.price - 1 : null,
-                    pos: (o.f[0] - sk.min) / (sk.max - sk.min) });
+                    pos: o.f.length ? (o.f[0] - sk.min) / (sk.max - sk.min) : Infinity });
       }
     }
     const sorters = {
@@ -834,8 +842,10 @@
         <td class="n">${money(r.o.trade)}</td><td class="n">${r.eq != null ? money(r.eq) : "—"}</td>
         <td class="n">${r.mq ? `${money(r.mq.price)}<br>${srcBadge(r.mq, r.hash)}` : "—"}</td>
         <td class="n ${r.gap == null ? "" : r.gap < 0 ? "win" : r.gap > 0.05 ? "loss" : ""}">${r.gap != null ? pct(r.gap, true) : "—"}</td>
-        <td class="n">${r.o.f.slice(0, 3).map((f) => f.toFixed(4)).join("<br>")}${r.o.n > 3 ? `<br><span class="muted small">… ${r.o.hi.toFixed(4)}</span>` : ""}</td>
-        <td><button type="button" class="btn sm ghost" data-tiadd="${esc(r.hash)}" data-tip="${r.o.trade}" title="Ajouter son plus bas float libre au constructeur">+</button></td></tr>`).join("");
+        <td class="n">${r.o.f.length ? r.o.f.slice(0, 3).map((f) => f.toFixed(4)).join("<br>") + (r.o.n > 3 ? `<br><span class="muted small">… ${r.o.hi.toFixed(4)}</span>` : "")
+          : `<span class="muted small">à venir</span>`}${floatAge(r.o) ? `<br><span class="muted small">${floatAge(r.o).slice(3)}</span>` : ""}</td>
+        <td><button type="button" class="btn sm ghost" data-tiadd="${esc(r.hash)}" data-tip="${r.o.trade}"${r.o.f.length
+          ? ` title="Ajouter son plus bas float libre au constructeur"` : ` disabled title="Floats pas encore relevés"`}>+</button></td></tr>`).join("");
     return `<div class="scroll"><table class="ti-table"><thead><tr><th></th><th>Covert</th><th class="n">Stock</th><th class="n">Échange</th>
         <th class="n">Tu cèdes</th><th class="n">Marché</th><th class="n">Écart</th><th class="n">Plus bas floats</th><th></th></tr></thead>
       <tbody>${body}</tbody></table></div>${rows.length > shown.length ? `<p class="muted small">${shown.length} lignes affichées sur ${rows.length} : filtre pour affiner.</p>` : ""}`;
@@ -847,6 +857,7 @@
     const offer = (stockOffers().by[hash] || []).find((o) => o.trade === trade);
     if (!c || !offer) return "Item introuvable dans le stock.";
     const used = new Set(state.slots.filter((s) => s && s.ti === trade && s.name === c.name).map((s) => s.float));
+    if (!offer.f.length) return "Les floats de cette pile ne sont pas encore relevés : réessaie après le prochain relevé.";
     const f = offer.f.find((x) => !used.has(x));
     if (f == null) return "Tous les floats relevés de cette pile sont déjà dans le constructeur.";
     const i = state.slots.findIndex((s) => !s);

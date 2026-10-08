@@ -66,6 +66,7 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   // float exact + prix impose sur la case 2
   await p.click('#slots [data-slot="1"]');
   await p.waitForSelector("#picker[open]");
+  await p.waitForTimeout(100);
   await p.fill("#pk-float", "0.2");
   await p.fill("#pk-price", "50");
   await p.click("#pk-put");
@@ -216,7 +217,9 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     await p.waitForTimeout(150);
     const names = await p.$$eval("#ti-stock-table tbody td:nth-child(2) b", (x) => x.map((e) => e.innerText));
     check("filtre « Empress »", names.length > 0 && names.every((n) => /Empress/.test(n)), names.slice(0, 2).join(", "));
-    await p.click("#ti-stock-table [data-tiadd]");
+    await p.fill("#ti-q", "");
+    await p.waitForTimeout(150);
+    await p.click("#ti-stock-table [data-tiadd]:not([disabled])");
     check("ajout au constructeur", /case 1/.test(await text(p, "#ti-msg")), await text(p, "#ti-msg"));
     await p.screenshot({ path: path.join(out, "tradeit-stock.png"), fullPage: false });
     await p.click('.tabs [data-tab="builder"]');
@@ -231,7 +234,7 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
     await p.click('#pk-list [data-pick="AK-47 | The Empress"]');
     const offers = await p.$$eval("#pk-detail .pk-offer", (x) => x.length);
     check("selecteur : stock tradeit du Covert", offers > 0, `${offers} piles`);
-    if (offers) {
+    if (await p.$("#pk-detail .pk-offer .fl")) {
       const f = await text(p, "#pk-detail .pk-offer .fl");
       await p.click("#pk-detail .pk-offer .fl");
       check("selecteur : item tradeit choisi", (await text(p, "#pk-detail .ti-pick")).includes(f), f);

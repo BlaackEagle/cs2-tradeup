@@ -21,17 +21,6 @@ for (const k of pr.order) {
   console.log(`  ${s.label.padEnd(24)} ${s.ok ? "OK " : s.stale ? "ANC" : "KO "} ${String(s.count).padStart(5)} prix` +
               `${a != null ? `, il y a ${a} min` : ""}${s.error ? "  (" + s.error.slice(0, 60) + ")" : ""}`);
 }
-if (pr.tradeit) {
-  const t = pr.tradeit;
-  console.log(`  ${t.label.padEnd(24)} ${t.ok ? "OK " : t.stale ? "ANC" : "KO "} ${String(t.count).padStart(5)} Coverts` +
-              `${t.error ? "  (" + t.error.slice(0, 60) + ")" : ""}`);
-  // exemple : prix d'echange / prix de marche d'un Covert (attendu ~1,8)
-  const h = "AK-47 | The Empress (Field-Tested)";
-  const it = pr.items[h] || {};
-  const mk = ["sk", "cf", "dm", "st"].map((k) => it[k] && it[k][0]).filter(Boolean);
-  if (it.tt && mk.length) console.log(`    ${h} : echange ${it.tt[0].toFixed(2)} / marche ${Math.min(...mk).toFixed(2)} = x${(it.tt[0] / Math.min(...mk)).toFixed(3)}`);
-}
-
 // memes reglages que le site par defaut : sources live seulement
 const m = E.create(cat, pr, { fee: 2, keyPrice: 2.49, sources: ["sk", "cf", "dm", "st"] });
 const targets = process.argv.slice(2).length ? process.argv.slice(2)
@@ -74,8 +63,10 @@ if (fs.existsSync(tf)) {
   ratios.sort((a, b) => a - b);
   const med = ratios[ratios.length >> 1];
   const rate = 1 / (0.92 * med);
+  const st = t.stats || {};
   console.log(`\n=== stock tradeit : ${n} items, ${Object.keys(t.items || {}).length} skins et usures, ` +
-              `releve il y a ${ageMin(t.updated_at)} min${t.complete ? "" : " (PARTIEL)"} ===`);
+              `releve il y a ${ageMin(t.updated_at)} min ; floats lus pour ${st.with_floats}/${st.offers} piles, ` +
+              `${st.requests} requetes dont ${st.http429} refusees (429) ===`);
   if (ratios.length < 10) console.log("  pas assez de prix de marche pour estimer le taux d'echange");
   else console.log(`  echange / marche median x${med.toFixed(3)} sur ${ratios.length} Coverts -> taux estime ${rate.toFixed(3)}`);
   for (const st of ratios.length < 10 ? [] : [false, true]) {

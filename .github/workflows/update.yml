@@ -9,8 +9,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    # une sonde ne redeploie pas le site
-    paths-ignore: [scripts/probe_tradeit.py, .github/workflows/probe.yml]
 
 permissions:
   contents: read
