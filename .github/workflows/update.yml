@@ -82,9 +82,42 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # Controle du site publie, vu d'internet. N'echoue jamais le run (pas
+  # d'e-mails d'echec en boucle) : le resultat se lit dans le log.
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Le site en ligne repond
+        env:
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          url="${PAGE_URL%/}"
+          echo "adresse publiee : $url"
+          sleep 20
+          curl -sS -o page.html -w "accueil : HTTP %{http_code}, certificat %{ssl_verify_result} (0 = valide)\n" "$url/"
+          grep -q "Trade-Up" page.html && echo "contenu : OK" || echo "contenu : MANQUANT"
+          grep -q 'content="noindex' page.html && echo "noindex : OK" || echo "noindex : ABSENT"
+          curl -sS -o prices.json "$url/data/prices.json"
+          python3 -c "
+          import json, datetime
+          d = json.load(open('prices.json'))
+          t = datetime.datetime.fromisoformat(d['updated_at'])
+          age = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 60
+          live = [s['label'] for k, s in d['sources'].items() if k in ('sk', 'cf', 'dm', 'st') and s.get('ok')]
+          print(f\"prix : {d['currency']}, releve il y a {age:.0f} min, sources live : {', '.join(live)}\")
+          "
+          echo "ancienne adresse github.io :"
+          curl -sS -o /dev/null -w "  HTTP %{http_code} -> %{redirect_url}\n" "https://blaackeagle.github.io/cs2-tradeup/"
+          echo "http -> https :"
+          curl -sS -o /dev/null -w "  HTTP %{http_code} -> %{redirect_url}\n" "http://${url#https://}/"
