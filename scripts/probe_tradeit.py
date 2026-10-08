@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Sonde temporaire n°3 : comment le site de tradeit lit l'inventaire de
-l'utilisateur et valorise ses items (code autour des routes concernees).
+Sonde temporaire n°4 : valeur donnee a l'utilisateur (userPrice) et
+inventaire Steam lu par tradeit a partir d'un steamId, sans connexion.
 """
-import re
+import json
 import sys
 
 import requests
@@ -11,39 +11,33 @@ import requests
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 S = requests.Session()
-S.headers.update({"User-Agent": UA})
+S.headers.update({"User-Agent": UA, "Accept": "application/json",
+                  "Origin": "https://tradeit.gg", "Referer": "https://tradeit.gg/csgo/trade"})
+API = "https://tradeit.gg/api/v2"
 
-html = S.get("https://tradeit.gg/csgo/trade", timeout=30).text
-srcs = re.findall(r"""(?:src|href)=["']([^"']+\.js)["']""", html)
-srcs += re.findall(r"""["'](/_nuxt/[A-Za-z0-9_\-]+\.js)["']""", html)
-seen, bundles = set(), []
-queue = list(dict.fromkeys(srcs))
-# suit les imports dynamiques des chunks (_nuxt/xxx.js) jusqu'a 120 fichiers
-while queue and len(bundles) < 120:
-    s = queue.pop(0)
-    url = s if s.startswith("http") else "https://tradeit.gg" + (s if s.startswith("/") else "/" + s)
-    if url in seen:
-        continue
-    seen.add(url)
+
+def call(label, method, path, n=2200, **kw):
+    r = S.request(method, API + path, timeout=40, **kw)
+    print(f"\n### {label}\n{method} {r.url}  body={json.dumps(kw.get('json'))[:200] if kw.get('json') else ''}")
+    print(f"-> HTTP {r.status_code} | {r.headers.get('content-type')} | {len(r.content)} octets")
     try:
-        js = S.get(url, timeout=30).text
-    except Exception:                                        # noqa: BLE001
-        continue
-    bundles.append((url, js))
-    for m in re.findall(r"""["'](?:\./|/_nuxt/)?([A-Za-z0-9_\-]{6,}\.js)["']""", js):
-        queue.append("/_nuxt/" + m)
-print(f"{len(bundles)} fichiers JS lus")
+        d = r.json()
+        print("   extrait :", json.dumps(d, ensure_ascii=False)[:n])
+        return d
+    except ValueError:
+        print("   texte :", r.text[:300])
+        return None
 
-for needle in ["inventory/my/data", "items-prices", "checkTrade", "priceForTrade", "tradeValue", "userPrice"]:
-    hits = 0
-    for url, js in bundles:
-        for m in re.finditer(re.escape(needle), js):
-            if hits >= 4:
-                break
-            a, b = max(0, m.start() - 450), min(len(js), m.end() + 450)
-            print(f"\n=== {needle} — {url.rsplit('/', 1)[-1]} @ {m.start()}")
-            print(re.sub(r"\s+", " ", js[a:b]))
-            hits += 1
-    if not hits:
-        print(f"\n=== {needle} : introuvable")
+
+# groupIds vus dans la boutique : Empress MW, Empress FT, Agent Ava FBI
+groups = [63043, 63042, 318055]
+for ctx in ("trade", "store"):
+    call(f"items-prices groupIds, contexte {ctx}", "POST", "/inventory/items-prices",
+         json={"context": ctx, "groupIds": groups, "appId": 730})
+call("items-prices groupIds sans appId", "POST", "/inventory/items-prices",
+     json={"context": "trade", "groupIds": groups})
+
+# inventaire d'un compte par steamId : un bot de tradeit vu dans la boutique
+for sid in ["76561199182740223"]:
+    d = call("inventory/search par steamId", "GET", "/inventory/search", params={"steamId": sid}, n=3000)
 sys.exit(0)
