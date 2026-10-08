@@ -100,7 +100,28 @@ def covert_names(catalog):
 
 def price_of(it):
     p = it.get("priceForTrade") or it.get("price")
-    return int(p) if p else None
+    return int(p) if isinstance(p, (int, float)) and p > 0 else None
+
+
+def lock_of(v):
+    """Jours de blocage : un nombre, ou une liste (une valeur par exemplaire d'une pile)."""
+    if isinstance(v, list):
+        return max([lock_of(x) for x in v] or [0])
+    return int(v) if isinstance(v, (int, float)) and v > 0 else 0
+
+
+def float_of(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0 <= f <= 1 else None
+
+
+def count_of(v):
+    if isinstance(v, list):
+        return len(v)
+    return int(v) if isinstance(v, (int, float)) and v > 0 else None
 
 
 def load_previous():
@@ -160,36 +181,43 @@ def main():
     log(f"[stock] {len(found)} Coverts cherches sur {len(catalog['coverts'])} en {time.time() - t0:.0f}s"
         + (f" -- arret : {stopped}" if stopped else ""))
 
+    def add_line(offers, h, it, count):
+        """Une ligne de la recherche : une pile (floats a lire), ou un exemplaire seul (float connu)."""
+        p = price_of(it)
+        lock = lock_of(it.get("tradeLockDay"))
+        f = float_of(it.get("floatValue"))
+        if it.get("assetId") is not None and f is not None:
+            f = round(f, 10)
+            same = next((o for o in offers.get(h, []) if o.get("g") is None and o["p"] == p), None)
+            if same:
+                same["n"] += 1
+                same["fn"] += 1
+                same["f"] = sorted(same["f"] + [f])[:KEEP]
+                same["hi"] = max(same["hi"], f)
+            else:
+                offers.setdefault(h, []).append({"g": None, "p": p, "n": 1, "f": [f], "hi": f,
+                                                 "at": stamp, "fn": 1, "lock": lock})
+            return
+        gid = it.get("groupId")
+        if gid is None:
+            return
+        old = prev_by_group.get(gid) or {}
+        o = {"g": gid, "p": p, "n": count_of(count) or old.get("n") or 1, "f": old.get("f") or [],
+             "hi": old.get("hi"), "at": old.get("at"), "fn": old.get("fn"), "lock": old.get("lock", lock)}
+        if o["at"] and age_h(o["at"]) > MAX_CARRY_H:
+            o.update(f=[], hi=None, at=None, fn=None)
+        offers.setdefault(h, []).append(o)
+
     # offres a jour : celles des Coverts cherches, sinon les precedentes
     offers = {}                                    # hash -> [offre]
     for base in catalog["coverts"]:
         if base in found:
             for h, rows in found[base].items():
                 for it, count in rows:
-                    p = price_of(it)
-                    lock = int(it.get("tradeLockDay") or 0)
-                    if it.get("assetId") is not None and it.get("floatValue") is not None:
-                        # exemplaire seul : son float arrive avec la recherche
-                        same = next((o for o in offers.get(h, []) if o.get("g") is None and o["p"] == p), None)
-                        f = round(float(it["floatValue"]), 10)
-                        if same:
-                            same["n"] += 1
-                            same["fn"] += 1
-                            same["f"] = sorted(same["f"] + [f])[:KEEP]
-                            same["hi"] = max(same["hi"], f)
-                        else:
-                            offers.setdefault(h, []).append({"g": None, "p": p, "n": 1, "f": [f], "hi": f,
-                                                             "at": stamp, "fn": 1, "lock": lock})
-                        continue
-                    gid = it.get("groupId")
-                    if gid is None:
-                        continue
-                    old = prev_by_group.get(gid) or {}
-                    o = {"g": gid, "p": p, "n": int(count or old.get("n") or 1), "f": old.get("f") or [],
-                         "hi": old.get("hi"), "at": old.get("at"), "fn": old.get("fn"), "lock": old.get("lock", lock)}
-                    if o["at"] and age_h(o["at"]) > MAX_CARRY_H:
-                        o.update(f=[], hi=None, at=None, fn=None)
-                    offers.setdefault(h, []).append(o)
+                    try:
+                        add_line(offers, h, it, count)
+                    except Exception as e:                  # noqa: BLE001 - une ligne bizarre ne bloque pas le releve
+                        errors.append(f"ligne : {type(e).__name__}")
         elif base in searched:
             for h, olds in prev_offers.get(base, {}).items():
                 offers[h] = [dict(o) for o in olds]
@@ -216,14 +244,14 @@ def main():
         except SourceError as e:
             errors.append(f"pile : {e}")
             continue
-        items = [it for it in d.get("items") or [] if it.get("floatValue") is not None]
-        fl = sorted(float(it["floatValue"]) for it in items)
+        items = [it for it in d.get("items") or [] if float_of(it.get("floatValue")) is not None]
+        fl = sorted(float_of(it["floatValue"]) for it in items)
         opened += 1
         if not fl:                                 # pile vendue entre-temps
             o["n"] = 0
             continue
         o.update(f=[round(x, 10) for x in fl[:KEEP]], hi=round(fl[-1], 10), at=stamp, fn=len(fl), n=len(fl),
-                 lock=max(int(it.get("tradeLockDay") or 0) for it in items))
+                 lock=max(lock_of(it.get("tradeLockDay")) for it in items))
         p = price_of(items[0])
         if p:
             o["p"] = p
