@@ -16,6 +16,13 @@ toutes les PACE secondes, et un releve incremental dans un budget de temps.
 Toute une pile est au meme prix : son plus bas float ne coute pas plus cher.
 On garde par pile ses KEEP plus bas floats (un contrat en prend au plus 5).
 
+Couteaux et gants (les resultats d'un contrat) : leur prix d'echange chez
+tradeit et leur valeur d'echange, c'est-a-dire ce que tradeit t'accorde si
+tu les lui echanges (userPrice, lu par items-prices). Recherche par gold,
+les moins recemment lus d'abord ; au premier releve, la liste rarity=Covert
+de la boutique (une vingtaine de pages) en donne deja une bonne partie.
+Pour un Doppler, la phase la moins chere fait foi, comme pour les marches.
+
 Donnees publiques de la boutique, lues sans connexion : rien de personnel.
 Si le releve echoue entierement, le fichier precedent est garde tant qu'il
 a moins de 12 h, puis supprime.
@@ -25,6 +32,8 @@ a moins de 12 h, puis supprime.
 
 import json
 import os
+import re
+import statistics
 import sys
 import time
 
@@ -36,12 +45,20 @@ from fetch_prices import CATALOG, MAX_CARRY_H, UA, SourceError, age_h, log, now 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "site", "data", "tradeit.json")
 API = os.environ.get("TRADEIT_API", "https://tradeit.gg/api/v2/inventory/data")   # faux serveur en test
+PRICES_API = API.replace("/inventory/data", "/inventory/items-prices")
 HEADERS = {"User-Agent": UA, "Accept": "application/json", "Referer": "https://tradeit.gg/csgo/trade"}
 KEEP = 8                                                     # floats gardes par pile
 PACE = float(os.environ.get("TRADEIT_PACE", 2.3))            # secondes entre deux requetes
-BUDGET_S = float(os.environ.get("TRADEIT_BUDGET", 8 * 60))   # duree max du releve
-SEARCH_SHARE = 0.5           # part du budget au plus pour les recherches quand un releve precedent existe
+BUDGET_S = float(os.environ.get("TRADEIT_BUDGET", 10 * 60))  # duree max du releve
+SEARCH_SHARE = 0.4           # part du budget au plus pour les recherches quand un releve precedent existe
+GOLD_SHARE = 0.25            # part du budget pour les couteaux et gants
+GOLD_MAX_AGE_H = 36          # valeurs d'echange d'un gold gardees au plus
+# phase d'un Doppler dans le nom tradeit ("Doppler Phase 2", "Gamma Doppler Emerald") ;
+# seulement apres "Doppler" : "Hydra Gloves | Emerald" est une finition, pas une phase
+PHASE = re.compile(r"(?<=Doppler) (Phase \d|Ruby|Sapphire|Black Pearl|Emerald)(?= \(|$)")
 SAMPLES = ["AK-47 | The Empress (Field-Tested)", "M4A4 | Temukau (Field-Tested)"]
+GOLD_SAMPLES = ["★ Butterfly Knife | Doppler (Factory New)", "★ Karambit | Doppler (Factory New)",
+                "★ Sport Gloves | Vice (Field-Tested)"]
 
 
 class RateLimited(Exception):
@@ -56,6 +73,14 @@ class Api:
         self.calls = self.n429 = self.streak = 0
 
     def get(self, params):
+        return self.call("GET", API, params=dict({"gameId": 730}, **params))
+
+    def prices(self, group_ids):
+        """Prix d'echange (sitePrice) et valeur d'echange (userPrice) de piles, par lots de 50."""
+        d = self.call("POST", PRICES_API, json={"context": "trade", "groupIds": group_ids, "appId": 730})
+        return (d or {}).get("data") or {}
+
+    def call(self, method, url, **kw):
         err = None
         for attempt in range(3):
             wait = self.last + PACE - time.time()
@@ -63,7 +88,7 @@ class Api:
                 time.sleep(wait)
             self.last = time.time()
             try:
-                r = requests.get(API, params=dict({"gameId": 730}, **params), headers=HEADERS, timeout=40)
+                r = requests.request(method, url, headers=HEADERS, timeout=40, **kw)
             except requests.RequestException as e:
                 err = type(e).__name__
                 time.sleep(5)
@@ -96,6 +121,28 @@ def covert_names(catalog):
             if c["st"]:
                 names[f"StatTrak™ {name} ({w})"] = name
     return names
+
+
+def gold_names(catalog):
+    """market_hash_name d'un couteau ou de gants (StatTrak compris) -> gold de base."""
+    names = {}
+    for name, g in catalog["golds"].items():
+        st = name.replace("★ ", "★ StatTrak™ ", 1)
+        if not g["wears"]:                         # couteau vanilla
+            names[name] = name
+            if g["st"]:
+                names[st] = name
+        for w in g["wears"]:
+            names[f"{name} ({w})"] = name
+            if g["st"]:
+                names[f"{st} ({w})"] = name
+    return names
+
+
+def gold_hash(name, gnames):
+    """Nom tradeit -> notre market_hash_name : "Doppler Phase 2" et "Doppler Ruby" -> "Doppler"."""
+    h = PHASE.sub("", name or "")
+    return h if h in gnames else None
 
 
 def price_of(it):
@@ -222,7 +269,99 @@ def main():
             for h, olds in prev_offers.get(base, {}).items():
                 offers[h] = [dict(o) for o in olds]
 
-    # 2. ouverture des piles, les plus utiles d'abord
+    # 2. couteaux et gants : prix d'echange et valeur d'echange (ce que tradeit t'accorde)
+    gnames = gold_names(catalog)
+    prev_golds = {h: v for h, v in ((prev or {}).get("golds") or {}).items()
+                  if h in gnames and age_h(v.get("at")) <= GOLD_MAX_AGE_H}
+    gold_searched = {k: v for k, v in ((prev or {}).get("gold_searched") or {}).items()
+                     if age_h(v) <= GOLD_MAX_AGE_H}
+    t1, gold_budget = time.time(), BUDGET_S * GOLD_SHARE
+    fresh, gsearched, listed = {}, set(), False    # hash -> {"p", "n", "gids": {groupId: prix}}
+
+    def add_gold(it, count):
+        h, p = gold_hash(it.get("name"), gnames), price_of(it)
+        if not h or not p:
+            return
+        e = fresh.setdefault(h, {"p": p, "n": 0, "gids": {}})
+        e["p"] = min(e["p"], p)                    # Doppler : la phase la moins chere
+        e["n"] += count_of(count) or 1
+        if it.get("groupId") is not None:
+            e["gids"][str(it["groupId"])] = p
+
+    if not prev_golds and not stopped:
+        # premier releve : la liste rarity=Covert de la boutique (incomplete mais large)
+        listed, seen = True, set()
+        for page in range(60):
+            if time.time() - t1 > gold_budget * 0.5:
+                break
+            try:
+                d = api.get({"rarity": "Covert", "offset": page * 500, "limit": 500})
+            except RateLimited as e:
+                stopped = str(e)
+                break
+            except SourceError as e:
+                errors.append(f"liste : {e}")
+                break
+            rows = d.get("items") or []
+            if not rows:
+                break
+            counts = d.get("counts") or {}
+            for it in rows:
+                k = it.get("groupId") if it.get("assetId") is None else ("a", it.get("assetId"))
+                if k not in seen:
+                    seen.add(k)
+                    add_gold(it, counts.get(str(it.get("groupId"))))
+    else:
+        bases = sorted(set(gnames.values()), key=lambda b: (b in gold_searched, gold_searched.get(b, "")))
+        for base in bases:
+            if stopped or time.time() - t1 > gold_budget * 0.75:
+                break
+            vanilla = not catalog["golds"][base]["wears"]
+            try:
+                d = api.get({"offset": 0, "limit": 500 if vanilla else 200, "searchValue": base.replace("★ ", "", 1)})
+            except RateLimited as e:
+                stopped = str(e)
+                break
+            except SourceError as e:
+                errors.append(f"recherche gold : {e}")
+                continue
+            counts = d.get("counts") or {}
+            for it in d.get("items") or []:
+                h = gold_hash(it.get("name"), gnames)
+                if h and gnames[h] == base:
+                    add_gold(it, counts.get(str(it.get("groupId"))))
+            gsearched.add(base)
+            gold_searched[base] = stamp
+
+    # valeur d'echange exacte des piles lues (lots de 50)
+    gids, user = [g for e in fresh.values() for g in e["gids"]], {}
+    for i in range(0, len(gids), 50):
+        if stopped or time.time() - t1 > gold_budget:
+            break
+        try:
+            data = api.prices([int(g) if g.isdigit() else g for g in gids[i:i + 50]])
+        except RateLimited as e:
+            stopped = str(e)
+            break
+        except SourceError as e:
+            errors.append(f"items-prices : {e}")
+            continue
+        for g, v in data.items():
+            u = v.get("userPrice") if isinstance(v, dict) else None
+            if isinstance(u, (int, float)) and u > 0:
+                user[str(g)] = int(u)
+
+    golds = {h: v for h, v in prev_golds.items() if gnames[h] not in gsearched}
+    for h, e in fresh.items():
+        us = [user[g] for g in e["gids"] if g in user]
+        old = prev_golds.get(h) or {}
+        u = min(us) if us else (old.get("u") if old.get("p") == e["p"] else None)
+        golds[h] = {"p": e["p"], "u": u, "n": e["n"], "at": stamp}
+    log(f"[stock] couteaux et gants : {len(fresh)} lus cette fois ({'liste de la boutique' if listed else f'{len(gsearched)} recherches'}), "
+        f"{len(golds)} avec un prix d'echange dont {sum(1 for v in golds.values() if v.get('u'))} avec leur valeur d'echange "
+        f"({time.time() - t1:.0f}s)")
+
+    # 3. ouverture des piles de Coverts, les plus utiles d'abord
     groups = [o for os_ in offers.values() for o in os_ if o.get("g") is not None]
 
     def priority(o):
@@ -272,11 +411,12 @@ def main():
     stats = {
         "coverts": len(catalog["coverts"]), "searched": len(found), "offers": len(all_groups),
         "with_floats": with_floats, "opened": opened, "items": sum(o["n"] for o in all_groups),
+        "golds": len(golds), "golds_user": sum(1 for v in golds.values() if v.get("u")),
         "requests": api.calls, "http429": api.n429, "errors": len(errors),
         "complete": with_floats == len(all_groups) and len(found) == len(catalog["coverts"]),
     }
     out = {"v": 2, "updated_at": stamp, "currency": "USD", "unit": "cents", "keep": KEEP,
-           "searched": searched, "stats": stats, "items": items}
+           "searched": searched, "gold_searched": gold_searched, "stats": stats, "items": items, "golds": golds}
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
 
@@ -289,6 +429,11 @@ def main():
         for o in items.get(n, []):
             fl = f"floats {o['f'][0]:.4f} -> {o['hi']:.4f}" if o["f"] else "floats pas encore lus"
             log(f"  {n:<40} {o['n']:>3} en stock a {o['p'] / 100:.2f} $ d'echange, {fl}")
+    for n in GOLD_SAMPLES:
+        v = golds.get(n)
+        if v:
+            u = f", tradeit en donne {v['u'] / 100:.2f} $" if v.get("u") else ""
+            log(f"  {n:<44} {v['p'] / 100:.2f} $ d'echange{u}")
     return 0
 
 

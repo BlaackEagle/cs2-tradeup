@@ -35,6 +35,12 @@
 
     <section class="toolbar" aria-label="Options">
       <label class="switch"><input type="checkbox" id="st"><span>StatTrak™</span></label>
+      <label>Prix
+        <select id="mode">
+          <option value="market">Marchés (Skinport, CSFloat, DMarket)</option>
+          <option value="tradeit">tradeit (prix d'échange)</option>
+        </select>
+      </label>
       <label>Devise <select id="cur"><option value="EUR">EUR €</option><option value="USD">USD $</option></select></label>
       <label>Frais de revente <span class="inline"><input id="fee" type="number" min="0" max="30" step="0.5" inputmode="decimal"> %</span></label>
       <details class="adv">
@@ -122,7 +128,7 @@
         <li><b>Float de sortie</b> = min + moyenne des positions des inputs × (max − min) du gold. Sans float exact, c'est le pire float de l'usure choisie : l'usure annoncée est garantie.</li>
         <li><b>Valeur d'un résultat</b> = prix le plus bas actuel parmi son usure et les usures meilleures, moins tes frais de revente. Seule la phase la moins chère d'un Doppler est cotée.</li>
         <li><b>Euros</b> : Skinport cote en € ; CSFloat, DMarket et Steam en $, convertis au taux BCE du jour. Un prix de plus de 12 h n'est jamais repris.</li>
-        <li><b>tradeit</b> : le stock d'échange est relevé item par item toutes les 30 minutes (float exact, prix d'échange, piles). Un item payé en échange coûte la valeur marché de ce que tu cèdes : prix d'échange × ton taux (valeur marché ÷ valeur d'échange de tes items cochés), ou un taux estimé sans ton inventaire.</li>
+        <li><b>Prix tradeit</b> : tout en monnaie d'échange tradeit, sans comparaison aux autres sites. Un Covert coûte son prix d'échange (stock relevé item par item toutes les 30 minutes : float exact, piles) ; un couteau ou des gants obtenus valent ce que tradeit t'en donne en échange ; ton solde est la valeur d'échange de tes skins. Pas de frais en plus. Un gold que tradeit n'a pas en stock reçoit une valeur estimée, signalée.</li>
         <li>Une moyenne n'est pas une promesse : un contrat rentable en moyenne peut perdre, et inversement. Les golds reçus sont bloqués 7 jours.</li>
       </ul>
     </section>

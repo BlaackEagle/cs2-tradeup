@@ -309,10 +309,10 @@ test("evaluate : incomplet, StatTrak impossible", () => {
 });
 
 // Reference : meilleur profit d'une caisse par enumeration complete, sans elagage
-function refBestProfit(cat, pr, ci, st, fee) {
+function refBestProfit(cat, pr, ci, st, fee, extra) {
   const col = cat.collections[ci];
   const sub = { ...cat, collections: [col] };
-  const m = E.create(sub, pr, { fee });
+  const m = E.create(sub, pr, Object.assign({ fee }, extra));
   const cands = [];
   for (const name of col.inputs) {
     const sk = cat.coverts[name];
@@ -366,6 +366,25 @@ test("donnees reelles : evaluate = optimiseur sur le contrat retenu", () => {
   near(r.cost, tu.cost, 1e-9, "cout");
   near(r.ev, tu.ev, 1e-9, "valeur attendue");
   near(r.outcomes.find((o) => o.name === "★ Butterfly Knife | Doppler").p, tu.p, 1e-12, "chance de la cible");
+});
+
+test("prix personnalises : achat et valeur des golds (mode tradeit)", () => {
+  const market = E.create(toy, prices, {});
+  const buy = (h) => { const q = market.quote(h); return q ? { price: q.price * 2, src: "ti" } : null; };
+  const val = (h) => { const it = prices.items[h]; return it ? { price: it.sk[0] * 1.5, src: "ti", est: h.includes("Rust") } : null; };
+  const opts = { fee: 0, quote: buy, valueQuote: val };
+  const m = E.create(toy, prices, opts);
+  // 5x AK | A a 0.20 : FT a 150 x 2 = 300 piece ; Doppler FN 1000 x 1.5, Rust BS 120 x 1.5
+  const r = m.evaluate(Array(5).fill({ name: "AK | A", float: 0.2 }));
+  assert.strictEqual(r.cost, 1500);
+  near(r.ev, (1500 + 180) / 2, 1e-9, "valeur moyenne");
+  assert.ok(r.outcomes.find((o) => o.name === "★ K | Rust").est, "valeur estimee signalee");
+  assert.ok(!r.outcomes.find((o) => o.name === "★ K | Doppler").est);
+  near(m.analyze("★ K | Doppler", {}).buy.cost, 800 * 2, 1e-9, "achat direct au prix personnalise");
+  for (const b of m.bestContracts({})) {
+    const ci = toy.collections.findIndex((c) => c.case === b.case);
+    near(b.profit, refBestProfit(toy, prices, ci, false, 0, opts), 1e-9, b.case);
+  }
 });
 
 // ------------------------------------------------- stock reel (items precis)
