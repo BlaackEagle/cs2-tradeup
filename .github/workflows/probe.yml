@@ -1,4 +1,4 @@
-name: Analyse BFK (temporaire)
+name: Analyse ponctuelle (temporaire)
 
 on:
   push:
@@ -23,4 +23,4 @@ jobs:
             curl -sf -o "live/$f" "https://tradeup.jaouadkabouri.dev/data/$f"
           done
           ls -la live
-      - run: node scripts/bfk_analysis.js live
+      - run: node scripts/contract_check.js live
