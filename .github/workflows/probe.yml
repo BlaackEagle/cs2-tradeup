@@ -1,4 +1,4 @@
-name: Sonde tradeit (temporaire)
+name: Analyse BFK (temporaire)
 
 on:
   push:
@@ -8,13 +8,19 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  bfk:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
-      - run: pip install requests
-      - run: python scripts/probe_tradeit.py
+          node-version: "22"
+      - name: Donnees du site en ligne
+        run: |
+          mkdir -p live
+          for f in catalog.json prices.json tradeit.json; do
+            curl -sf -o "live/$f" "https://tradeup.jaouadkabouri.dev/data/$f"
+          done
+          ls -la live
+      - run: node scripts/bfk_analysis.js live
