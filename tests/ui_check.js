@@ -111,6 +111,15 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
   check("gold vise -> charge dans le constructeur", (await p.getAttribute('.tabs [data-tab="builder"]', "aria-selected")) === "true"
         && (await p.$$eval("#slots .slot.filled", (x) => x.length)) === 5);
 
+  // cible « toutes finitions » : un Butterfly, n'importe lequel
+  await p.click('.tabs [data-tab="target"]');
+  await p.click('#examples [data-ex="★ Butterfly Knife (toutes finitions)"]');
+  await p.waitForTimeout(300);
+  const tt = await text(p, "#t-result");
+  check("cible toutes finitions : Breakout a 100 %", /n'importe quelle finition/.test(tt) && /Operation Breakout Weapon Case \(100 % par Covert\)/.test(tt), tt.slice(0, 140));
+  check("cible toutes finitions : achat direct et trade-ups", (await p.$$eval("#t-result .method", (x) => x.length)) >= 2);
+  check("cible toutes finitions : usure minimale sans objet", await p.$eval("#wear", (e) => e.disabled));
+
   // ------------------------------------------------------- meilleurs contrats
   await p.click('.tabs [data-tab="best"]');
   await p.waitForSelector("#best-list .bc");
@@ -255,6 +264,24 @@ const { chromium } = require(path.join(require("child_process").execSync("npm ro
       const s = await text(p, '#slots [data-slot="1"]');
       check("case 2 : float et prix tradeit", s.includes(f) && /tradeit/.test(s), s);
     }
+  }
+
+  if (hasStock) {
+    // gold vise en prix tradeit : items precis du stock pour avoir un Butterfly
+    await p.selectOption("#mode", "tradeit");
+    await p.click('.tabs [data-tab="target"]');
+    await p.click('#examples [data-ex="★ Butterfly Knife (toutes finitions)"]');
+    await p.waitForSelector("#t-result .method");
+    const tg = await p.$$eval("#t-result .method.tg .ti-items", (x) => x.map((e) => e.children.length));
+    check("gold vise en prix tradeit : contrats de 5 items precis", tg.length > 0 && tg.every((n) => n === 5), tg.join(","));
+    check("gold vise en prix tradeit : sans autres sites", !/Skinport|CSFloat|DMarket/.test(await text(p, "#t-result")));
+    await p.click("#t-result [data-tgres]");
+    await p.waitForTimeout(100);
+    check("resultats : la cible est encadree", (await p.$$eval("#t-result .ti-oc:not([hidden]) .oc.t", (x) => x.length)) > 0);
+    await p.screenshot({ path: path.join(out, "gold-vise-tradeit.png"), fullPage: false });
+    await p.click("#t-result [data-tgload]");
+    await p.waitForTimeout(200);
+    check("gold vise -> constructeur : 5 items tradeit", (await p.$$eval("#slots .src.ti", (x) => x.length)) === 5);
   }
 
   // ------------------------------------------------------------------ mobile

@@ -444,6 +444,7 @@ function bruteStock(cat, pr, listings, o) {
       if (pick.reduce((s, x) => s + x.price, 0) > budget) continue;
       const r = m.evaluate(pick, { st: o.st });
       if (r.profit == null) continue;
+      if (o.maxX && !(r.x < o.maxX)) continue;
       combos++;
       if (r.profit > overall) overall = r.profit;
       const per = {};
@@ -490,6 +491,84 @@ test("stock reel = enumeration complete (jouet, 24 tirages, melanges et budgets)
     }
   }
   console.log(`      ${runs} optimisations verifiees sur ${combos} contrats enumeres`);
+});
+
+test("stock reel : plafond de position moyenne (usure minimale) = enumeration complete", () => {
+  let runs = 0;
+  for (let seed = 101; seed <= 112; seed++) {
+    const listings = randomStock(toy, rng(seed), { st: false, skip: 0.25, depth: 3 });
+    for (const maxX of [0.3, 0.5]) {
+      checkStock(toy, prices, listings, { fee: 2, fillers: seed % 3, maxX }, `graine ${seed} maxX ${maxX}`);
+      runs++;
+    }
+  }
+  console.log(`      ${runs} optimisations sous plafond verifiees`);
+});
+
+/** reference : cout attendu minimal pour obtenir l'une des cibles, tous les multisets de 5 (Covert, usure) */
+function bruteTargets(cat, pr, names, fee) {
+  const m = E.create(cat, pr, { fee });
+  const tset = new Set(names);
+  const cands = [];
+  for (const col of cat.collections) {
+    if (!col.pool.some(([n]) => tset.has(n))) continue;
+    for (const name of col.inputs) for (const w of cat.coverts[name].wears) {
+      if (m.quote(E.hashName(name, w, false))) cands.push({ name, wear: w });
+    }
+  }
+  let best = Infinity;
+  const n = cands.length;
+  for (let a = 0; a < n; a++) for (let b = a; b < n; b++) for (let c = b; c < n; c++)
+    for (let d = c; d < n; d++) for (let e = d; e < n; e++) {
+      const r = m.evaluate([a, b, c, d, e].map((i) => cands[i]));
+      if (r.cost == null) continue;
+      let p = 0, vo = 0;
+      for (const oc of r.outcomes) {
+        if (tset.has(oc.name)) p += oc.p; else vo += oc.p * (oc.net || 0);
+      }
+      if (p > 0) best = Math.min(best, (r.cost - vo) / p);
+    }
+  return best;
+}
+
+test("cible a plusieurs finitions (n'importe lequel) = enumeration complete", () => {
+  const set = ["★ K | Doppler", "★ K | Rust"];
+  const m = E.create(toy, prices, { fee: 2 });
+  const r = m.analyze(set, {});
+  const tu = r.methods.find((x) => x.optimal);
+  near(tu.expected, bruteTargets(toy, prices, set, 2), 1e-9, "cout attendu");
+  assert.deepStrictEqual(r.cases.sort(), ["Caisse 1", "Caisse 2"]);
+  // Caisse 1 ne donne que des K : 100 % de chance par input
+  const c1 = r.methods.find((x) => x.kind === "tradeup" && x.cases.length === 1 && x.cases[0] === "Caisse 1");
+  near(c1.p, 1, 1e-12, "P(K) en Caisse 1");
+  assert.ok(tu.outcomes.filter((o) => o.isTarget).length >= 1);
+  // achat direct : le moins cher de toutes les finitions
+  assert.strictEqual(r.buy.cost, 120);
+  assert.strictEqual(r.buy.best.name, "★ K | Rust");
+  // l'usure minimale est ignoree pour plusieurs cibles
+  assert.strictEqual(m.analyze(set, { minWear: "Factory New" }).minWear, "any");
+  // une seule cible : meme resultat qu'avant
+  near(m.analyze(["★ K | Doppler"], {}).methods.find((x) => x.optimal).expected,
+       m.analyze("★ K | Doppler", {}).methods.find((x) => x.optimal).expected, 1e-12, "tableau d'un seul gold");
+});
+
+test("donnees reelles : un Butterfly, n'importe lequel", () => {
+  const dir = path.join(__dirname, "..", "site", "data");
+  const cat = JSON.parse(fs.readFileSync(path.join(dir, "catalog.json")));
+  const pr = JSON.parse(fs.readFileSync(path.join(dir, "prices.json")));
+  const names = Object.keys(cat.golds).filter((n) => n === "★ Butterfly Knife" || n.startsWith("★ Butterfly Knife | "));
+  const m = E.create(cat, pr, { fee: 2 });
+  const r = m.analyze(names, {});
+  assert.ok(r.cases.includes("Operation Breakout Weapon Case") && r.cases.length === 5, r.cases.join(", "));
+  const tu = r.methods.find((x) => x.optimal);
+  assert.ok(tu, "un trade-up est propose");
+  const brk = r.methods.find((x) => x.kind === "tradeup" && x.cases.length === 1 && x.cases[0] === "Operation Breakout Weapon Case");
+  near(brk.p, 1, 1e-12, "Breakout : un Butterfly a chaque contrat");
+  // exactitude sur la seule caisse Breakout (enumeration complete raisonnable)
+  const sub = { ...cat, collections: cat.collections.filter((c) => c.case === "Operation Breakout Weapon Case") };
+  const one = E.create(sub, pr, { fee: 2 }).analyze(names, {}).methods.find((x) => x.optimal);
+  near(one.expected, bruteTargets(sub, pr, names, 2), 1e-6 * one.expected, "Breakout seule");
+  console.log(`      meilleur : ${tu.label}, P ${(tu.p * 100).toFixed(1)} %, cout attendu ${tu.expected.toFixed(2)} (achat direct ${r.buy.cost && r.buy.cost.toFixed(2)})`);
 });
 
 test("stock reel : un complement d'une autre caisse peut battre le 100 %", () => {

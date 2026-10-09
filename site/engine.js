@@ -157,10 +157,11 @@
      * change d'usure : on la calcule une fois par intervalle.
      */
     function othersCurve(pool, target, st) {
+      const isT = target instanceof Set ? (n) => target.has(n) : (n) => n === target;
       const cuts = new Set([0]);
       for (const o of pool) {
         const g = catalog.golds[o.name];
-        if (o.name === target || !g.wears.length) continue;
+        if (isT(o.name) || !g.wears.length) continue;
         for (const [, lo, hi] of wears) {
           for (const b of [lo, hi]) {
             const x = (b - g.min) / (g.max - g.min);
@@ -173,7 +174,7 @@
         const mid = (x0 + (i + 1 < xs.length ? xs[i + 1] : 1)) / 2;
         let v = 0;
         for (const o of pool) {
-          if (o.name === target) continue;
+          if (isT(o.name)) continue;
           const r = goldAt(o.name, mid, st);
           if (r.value != null) v += o.w * r.value * (1 - fee);
         }
@@ -209,12 +210,14 @@
     }
 
     // ------------------------------------------------------- achat direct
-    function direct(target, st, minWear) {
-      const g = catalog.golds[target];
-      const rows = allowedWears(g, minWear).map((w) => {
-        const hash = hashName(target, w, st);
-        return { wear: w, hash, q: quote(hash), all: quotesAll(hash) };
-      });
+    function direct(tset, st, minWear) {
+      const rows = [];
+      for (const name of tset) {
+        for (const w of allowedWears(catalog.golds[name], minWear)) {
+          const hash = hashName(name, w, st);
+          rows.push({ name, wear: w, hash, q: quote(hash), all: quotesAll(hash) });
+        }
+      }
       const priced = rows.filter((r) => r.q);
       const best = priced.length ? priced.reduce((a, b) => (b.q.price < a.q.price ? b : a)) : null;
       return { kind: "buy", rows, best, cost: best ? best.q.price : null };
@@ -245,15 +248,15 @@
         b !== a && b.price <= a.price && b.xhi <= a.xhi && (b.price < a.price || b.xhi < a.xhi)));
     }
 
-    function prepare(target, st) {
+    function prepare(tset, st) {
       const cols = [];
       for (const col of catalog.collections) {
         const pool = poolOf(col, st);
-        const t = pool.find((o) => o.name === target);
-        if (!t) continue;
+        const wT = pool.reduce((s, o) => s + (tset.has(o.name) ? o.w : 0), 0);
+        if (!wT) continue;
         const front = candidatesFor(col, st);
         if (!front.length) continue;
-        cols.push({ col, pool, wT: t.w, cands: front, others: othersCurve(pool, target, st) });
+        cols.push({ col, pool, wT, cands: front, others: othersCurve(pool, tset, st) });
       }
       return cols;
     }
@@ -262,9 +265,10 @@
      * Cherche les 5 inputs qui minimisent le cout attendu pour obtenir la
      * cible : (cout du contrat - valeur des autres golds) / P(cible).
      */
-    function optimize(target, st, minWear, cols) {
-      const g = catalog.golds[target];
-      const lim = (minWear && minWear !== "any" && g.wears.length) ? wears[wearIdx[minWear]][2] : null;
+    function optimize(tset, st, minWear, cols) {
+      // usure minimale : seulement pour une cible unique (chaque gold a sa plage de float)
+      const g = tset.size === 1 ? catalog.golds[[...tset][0]] : null;
+      const lim = (g && minWear && minWear !== "any" && g.wears.length) ? wears[wearIdx[minWear]][2] : null;
       const cands = [];
       cols.forEach((c, ci) => c.cands.forEach((k) => cands.push(Object.assign({ ci }, k))));
       if (!cands.length) return null;
@@ -310,11 +314,11 @@
       })(0, 0, 0, 0);
 
       if (!best) return { impossible: true, xNeeded: lim != null ? (lim - g.min) / (g.max - g.min) : null };
-      return detail(target, st, cols, best.pick.map((i) => cands[i]), best);
+      return detail(tset, st, cols, best.pick.map((i) => cands[i]), best);
     }
 
-    function detail(target, st, cols, inputs, r) {
-      const g = catalog.golds[target];
+    function detail(tset, st, cols, inputs, r) {
+      const g = tset.size === 1 ? catalog.golds[[...tset][0]] : null;
       // regroupe les inputs identiques
       const grouped = [];
       for (const k of inputs) {
@@ -339,7 +343,7 @@
         return Object.assign(o, at, {
           hash: hashName(o.name, at.wear, st),
           net: at.value != null ? at.value * (1 - fee) : null,
-          isTarget: o.name === target,
+          isTarget: tset.has(o.name),
         });
       }).sort((a, b) => (b.isTarget - a.isTarget) || (b.p - a.p) || ((b.net || 0) - (a.net || 0)));
 
@@ -365,7 +369,7 @@
         outcomes: list,
         unpriced: list.filter((o) => o.value == null).length,
         // borne (jamais atteinte) du float de la cible : le float reel est en dessous
-        targetFloatSup: g.wears.length ? outFloat(g, r.x + EPS) : null,
+        targetFloatSup: g && g.wears.length ? outFloat(g, r.x + EPS) : null,
       };
     }
 
@@ -539,6 +543,8 @@
       const budget = o.budget > 0 ? o.budget : Infinity;
       const need = SLOTS - Math.min(2, Math.max(0, Math.round(o.fillers || 0)));
       const listings = o.listings || {};
+      // position moyenne maximale (strictement en dessous) : usure minimale d'une cible
+      const maxX = o.maxX > 0 ? o.maxX : Infinity;
 
       const cols = [];
       for (const col of catalog.collections) {
@@ -615,8 +621,8 @@
           .sort((a, b) => b.w - a.w || a.it.x - b.it.x);
         const byCol = cols.map(() => []);
         for (const e of L) byCol[e.it.ci].push(e);
-        return { hi: j + 1 < T.length ? T[j + 1] : Infinity, L, byCol: byCol.map(seq), any: null };
-      });
+        return { hi: Math.min(j + 1 < T.length ? T[j + 1] : Infinity, maxX), L, byCol: byCol.map(seq), any: null };
+      }).filter((d, j) => T[j] < maxX);
 
       /**
        * Items utiles sur un intervalle quand la caisse importe peu : un item
@@ -756,39 +762,47 @@
     }
 
     // ------------------------------------------------- ouverture de caisses
-    function unbox(target, st, minWear, col) {
-      const g = catalog.golds[target];
+    function unbox(tset, st, minWear, col) {
+      const g = tset.size === 1 ? catalog.golds[[...tset][0]] : null;
       const pool = poolOf(col, false);
-      const t = pool.find((o) => o.name === target);
+      const w = pool.reduce((s, o) => s + (tset.has(o.name) ? o.w : 0), 0);
       const cq = quote(col.hash);
-      if (!t || !cq) return null;
+      if (!w || !cq) return null;
       let frac = 1;
-      if (minWear && minWear !== "any" && g.wears.length) {
+      if (g && minWear && minWear !== "any" && g.wears.length) {
         const hi = wears[wearIdx[minWear]][2];
         frac = Math.min(1, Math.max(0, (hi - g.min) / (g.max - g.min)));
       }
-      const p = P_GOLD * t.w * frac * (st ? 0.1 : 1);
+      const p = P_GOLD * w * frac * (st ? 0.1 : 1);
       if (!p) return null;
       const cost = cq.price + keyPrice;
       return { kind: "unbox", case: col.case, caseQuote: cq, cost, p, expected: cost / p, tries: 1 / p };
     }
 
     // ---------------------------------------------------------- analyse
+    /**
+     * Toutes les facons d'obtenir la cible : un gold (son nom), ou plusieurs
+     * (tableau de noms, ex. toutes les finitions d'un couteau : on veut "un
+     * Butterfly, n'importe lequel"). L'usure minimale ne vaut que pour une
+     * cible unique.
+     */
     function analyze(target, o) {
       o = o || {};
-      const g = catalog.golds[target];
-      if (!g) throw new Error("gold inconnu : " + target);
-      const st = !!o.st && g.st;
-      const minWear = o.minWear || "any";
+      const names = Array.isArray(target) ? target : [target];
+      for (const n of names) if (!catalog.golds[n]) throw new Error("gold inconnu : " + n);
+      const tset = new Set(names);
+      const g = names.length === 1 ? catalog.golds[names[0]] : null;
+      const st = !!o.st && names.some((n) => catalog.golds[n].st);
+      const minWear = g ? o.minWear || "any" : "any";
 
       const methods = [];
-      const buy = direct(target, st, minWear);
+      const buy = direct(tset, st, minWear);
       if (buy.best) methods.push(Object.assign({ label: "Acheter directement", expected: buy.cost }, buy));
 
-      const cols = prepare(target, st);
+      const cols = prepare(tset, st);
       const notes = [];
       if (cols.length) {
-        const all = optimize(target, st, minWear, cols);
+        const all = optimize(tset, st, minWear, cols);
         if (all && all.impossible) {
           notes.push({ kind: "float", xNeeded: all.xNeeded });
         } else if (all) {
@@ -800,7 +814,7 @@
           methods.push(all);
           if (cols.length > 1) {
             for (const c of cols) {
-              const one = optimize(target, st, minWear, [c]);
+              const one = optimize(tset, st, minWear, [c]);
               if (!one || one.impossible) continue;
               // inutile d'afficher deux fois le meme contrat
               const same = all.cases.length === 1 && all.cases[0] === c.col.case;
@@ -812,13 +826,13 @@
         }
       }
       for (const col of catalog.collections) {
-        const u = unbox(target, st, minWear, col);
+        const u = unbox(tset, st, minWear, col);
         if (u) { u.label = `Ouvrir des ${col.case}`; methods.push(u); }
       }
       methods.sort((a, b) => a.expected - b.expected);
       return {
-        target, gold: g, st, minWear, buy, methods, notes,
-        cases: catalog.collections.filter((c) => poolOf(c, st).some((x) => x.name === target)).map((c) => c.case),
+        target, names, gold: g, st, minWear, buy, methods, notes,
+        cases: catalog.collections.filter((c) => poolOf(c, st).some((x) => tset.has(x.name))).map((c) => c.case),
       };
     }
 
