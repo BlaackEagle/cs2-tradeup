@@ -276,6 +276,10 @@ td img { width: 52px; aspect-ratio: 4 / 3; object-fit: contain; }
 .ti-it b { font-size: .7rem; line-height: 1.2; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .ti-it small { font-size: .7rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ti-oc { margin-top: 12px; }
+.method.tg { align-items: start; }
+.tg-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.tg-row:first-of-type { border-top: 0; padding-top: 0; }
+.tg-row h4 { margin: 0 0 2px; font-size: .75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; font-weight: 600; }
 .ti-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 8px; }
 .ti-tools input { flex: 1 1 240px; }
 .ti-table td { vertical-align: top; }

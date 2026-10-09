@@ -11,8 +11,8 @@
   };
 
   const SHORT = { "Factory New": "FN", "Minimal Wear": "MW", "Field-Tested": "FT", "Well-Worn": "WW", "Battle-Scarred": "BS" };
-  const EXAMPLES = ["★ Butterfly Knife | Doppler", "★ Karambit | Doppler", "★ M9 Bayonet | Fade",
-                    "★ Sport Gloves | Vice", "★ Talon Knife | Marble Fade", "★ Skeleton Knife | Fade"];
+  const EXAMPLES = ["★ Butterfly Knife (toutes finitions)", "★ Butterfly Knife | Doppler", "★ Karambit (toutes finitions)",
+                    "★ Karambit | Doppler", "★ M9 Bayonet | Fade", "★ Sport Gloves | Vice", "★ Skeleton Knife | Fade"];
   const KEY_PRICE = 2.49;            // cle de caisse Steam
   const MARKET = ["sk", "cf", "dm", "st"];
 
@@ -331,14 +331,14 @@
   /** cartes des resultats possibles d'un contrat */
   function ocCards(list) {
     return list.map((o) => {
-      const cls = o.profit == null ? "" : o.profit >= 0 ? "w" : "l";
+      const cls = (o.profit == null ? "" : o.profit >= 0 ? "w" : "l") + (o.isTarget ? " t" : "");
       const fl = o.float != null ? ` · ${o.float.toFixed(4)}` : "";
       return `<div class="oc ${cls}">
         ${img(o.img, o.name)}
         <div class="oc-n">${state.st && catalog.golds[o.name].st ? "StatTrak™ " : ""}${esc(short(o.name))}</div>
         <div class="oc-w">${esc(o.wear ? SHORT[o.wear] : "sans usure")}${fl}${o.cappedBy ? ` · coté au prix ${esc(SHORT[o.cappedBy])}` : ""}</div>
         <div class="oc-r"><span class="oc-p">${pct(o.p)}</span><span class="oc-v"${o.est ? ' title="Pas en stock chez tradeit : valeur d\'échange estimée"' : ""}>${o.net != null ? (o.est ? "≈ " : "") + money(o.net) : "?"}</span></div>
-        <div class="oc-g ${cls === "w" ? "win" : cls === "l" ? "loss" : "muted"}">${o.profit != null ? `${signed(o.profit)} <small>(${pct(o.roi, true)})</small>` : (o.net == null ? "sans prix actuel" : "")}</div>
+        <div class="oc-g ${o.profit == null ? "muted" : o.profit >= 0 ? "win" : "loss"}">${o.profit != null ? `${signed(o.profit)} <small>(${pct(o.roi, true)})</small>` : (o.net == null ? "sans prix actuel" : "")}</div>
       </div>`;
     }).join("");
   }
@@ -533,62 +533,203 @@
   }
 
   // ========================================================== GOLD VISE
+  // ---- cible : un gold, ou toutes les finitions d'un couteau / de gants
+  const ALL = " (toutes finitions)";
+  const typeOf = (n) => n.split(" | ")[0];                 // "★ Butterfly Knife | Fade" -> "★ Butterfly Knife"
+  const baseGold = (h) => h.replace(/ \((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/, "").replace("★ StatTrak™ ", "★ ");
+  function targetInfo(t) {
+    if (catalog.golds[t]) return { names: [t], single: t, type: null };
+    if (t && t.endsWith(ALL)) {
+      const type = t.slice(0, -ALL.length);
+      const names = Object.keys(catalog.golds).filter((n) => typeOf(n) === type);
+      if (names.length > 1) return { names, single: null, type };
+    }
+    return null;
+  }
+  /** nom choisi dans la liste, sans tenir compte des majuscules */
+  function matchTarget(v) {
+    if (targetInfo(v)) return v;
+    const low = v.toLowerCase();
+    const g = Object.keys(catalog.golds).find((n) => n.toLowerCase() === low);
+    if (g) return g;
+    const types = [...new Set(Object.keys(catalog.golds).map(typeOf))].map((t) => t + ALL);
+    return types.find((t) => t.toLowerCase() === low && targetInfo(t)) || null;
+  }
+
+  /**
+   * Avec le stock tradeit : pour chaque caisse qui donne la cible, deux
+   * contrats de 5 items precis (100 % de la caisse) :
+   *  - le moins cher pour l'avoir : minimise (cout - valeur des autres
+   *    resultats) / chance. La chance ne dependant que de la caisse, c'est le
+   *    contrat le plus rentable quand la cible ne vaut rien (optimiseur exact) ;
+   *  - le plus rentable en moyenne.
+   */
+  let tgMemo = { key: "", v: null };
+  function exactContracts(ti, st) {
+    const so = stockOffers();
+    if (!so) return null;
+    const key = [ti.names.join("|"), st, state.minWear, state.phaseMode, state.floatMode, state.off.join(","), stockRaw.updated_at].join("§");
+    if (tgMemo.key === key) return tgMemo.v;
+    const tset = new Set(ti.names);
+    const real = engine("tradeit");
+    const zero = TradeupEngine.create(catalog, prices, {
+      fee: 0, phaseMode: state.phaseMode, floatMode: state.floatMode,
+      sources: prices.order.filter((k) => !state.off.includes(k)),
+      quote: tradeitBuy, valueQuote: (h) => (tset.has(baseGold(h)) ? { price: 0, src: "ti" } : tradeitValue(h)),
+    });
+    // usure minimale d'une cible unique : plafond de la position moyenne des inputs
+    let maxX;
+    const g = ti.single ? catalog.golds[ti.single] : null;
+    if (g && g.wears.length && state.minWear !== "any") {
+      const lim = catalog.wears.find((w) => w[0] === state.minWear)[2];
+      maxX = (lim - g.min) / (g.max - g.min);
+    }
+    const sum = (r, col) => {
+      const pT = r.outcomes.reduce((t, o) => t + (tset.has(o.name) ? o.p : 0), 0);
+      const vo = r.outcomes.reduce((t, o) => t + (tset.has(o.name) ? 0 : o.p * (o.net || 0)), 0);
+      r.outcomes.forEach((o) => { o.isTarget = tset.has(o.name); });
+      return Object.assign(r, { pT, vo, expected: pT > 0 ? (r.cost - vo) / pT : Infinity, case: col.case });
+    };
+    const out = [];
+    for (const col of catalog.collections) {
+      const p = real.poolOf(col, st).reduce((t, o) => t + (tset.has(o.name) ? o.w : 0), 0);
+      if (!p) continue;
+      const listings = {};
+      for (const name of col.inputs) {
+        if (st && !catalog.coverts[name].st) continue;
+        for (const w of catalog.coverts[name].wears) {
+          const h = TradeupEngine.hashName(name, w, st);
+          if ((so.listings[h] || []).length) listings[h] = so.listings[h];
+        }
+      }
+      const opt = { listings, st, fillers: 0, src: "ti", maxX };
+      const c0 = zero.stockContracts(opt)[0];
+      if (!c0) continue;
+      const items = (r) => r.inputs.map((x) => ({ name: x.name, float: x.float, price: x.price, trade: x.q.trade, src: "ti" }));
+      const cheap = sum(real.evaluate(items(c0), { st }), col);
+      if (cheap.ev == null) continue;
+      const r1 = real.stockContracts(opt)[0];
+      const rich = r1 && items(r1).some((x, i) => x.float !== cheap.inputs[i].float || x.name !== cheap.inputs[i].name) ? sum(r1, col) : null;
+      out.push({ col, p, cheap, rich });
+    }
+    out.sort((a, b) => a.cheap.expected - b.cheap.expected);
+    tgMemo = { key, v: out };
+    return out;
+  }
+  let tgList = [];
+  const tgAt = (k) => { const [i, w] = k.split(":"); const e = tgList[+i]; return e && e[w]; };
+
   function renderTarget() {
-    const g = catalog.golds[state.target];
+    const ti = targetInfo(state.target);
     $("#target").value = state.target;
+    const g = ti && ti.single ? catalog.golds[ti.single] : null;
     const wears = g ? g.wears : [];
     $("#wear").innerHTML = `<option value="any">Peu importe</option>` +
       wears.slice(0, -1).map((w, i) => `<option value="${esc(w)}">${esc(w)}${i ? " ou mieux" : ""}</option>`).join("");
     if (![...$("#wear").options].some((o) => o.value === state.minWear)) state.minWear = "any";
     $("#wear").value = state.minWear;
     $("#wear").disabled = !wears.length;
-    if (!g) { $("#t-result").innerHTML = `<div class="panel empty">Choisis un couteau ou des gants.</div>`; return; }
+    if (!ti) { $("#t-result").innerHTML = `<div class="panel empty">Choisis un couteau ou des gants, une finition précise ou « toutes finitions ».</div>`; return; }
 
-    const st = state.st && g.st;
-    const res = engine().analyze(state.target, { st, minWear: state.minWear });
-    const label = st ? state.target.replace("★ ", "★ StatTrak™ ") : state.target;
-    const phases = g.phases.length ? `<p class="muted small">Phases : ${esc(g.phases.join(", "))}. Prix de la phase la moins chère ; une phase rare est un bonus non compté.</p>` : "";
-    const hero = `<div class="panel hero">${img(g.img, label)}<div><h2>${esc(label)}</h2>
-      <p>${res.cases.length ? `Par trade-up depuis : <b>${esc(res.cases.join(", "))}</b>` : "Aucune caisse ne le donne par trade-up dans ce mode."}</p>${phases}
-      ${state.st && !g.st ? '<p class="warn-box" style="margin:8px 0 0">Pas de version StatTrak™ (gants) : calcul en version normale.</p>' : ""}</div></div>`;
+    const st = state.st && ti.names.some((n) => catalog.golds[n].st);
+    const res = engine().analyze(ti.single || ti.names, { st, minWear: g ? state.minWear : "any" });
+    const tset = new Set(ti.names);
+    const stName = (n) => (st ? n.replace("★ ", "★ StatTrak™ ") : n);
+    const label = g ? stName(state.target) : `${stName(ti.type)} — n'importe quelle finition`;
+    const heroImg = g ? g.img : (catalog.golds[ti.type] || catalog.golds[ti.names[0]]).img;
+    const share = (cs) => {
+      const col = catalog.collections.find((c) => c.case === cs);
+      return engine().poolOf(col, st).reduce((t, o) => t + (tset.has(o.name) ? o.w : 0), 0);
+    };
+    const casesTxt = res.cases.length
+      ? `Par trade-up depuis : <b>${res.cases.map((c) => esc(c) + (g ? "" : ` (${pct(share(c))} par Covert)`)).join(", ")}</b>`
+      : "Aucune caisse ne le donne par trade-up dans ce mode.";
+    const phases = g && g.phases.length ? `<p class="muted small">Phases : ${esc(g.phases.join(", "))}. Prix de la phase la moins chère ; une phase rare est un bonus non compté.</p>` : "";
+    const many = g ? "" : `<p class="muted small">${ti.names.length} finitions possibles ; dans une caisse, chaque finition a la même chance.</p>`;
+    const hero = `<div class="panel hero">${img(heroImg, label)}<div><h2>${esc(label)}</h2>
+      <p>${casesTxt}</p>${phases}${many}
+      ${state.st && !st ? '<p class="warn-box" style="margin:8px 0 0">Pas de version StatTrak™ (gants) : calcul en version normale.</p>' : ""}</div></div>`;
 
-    const ranked = res.methods.filter((m) => m.kind !== "unbox");
+    const buy = res.methods.find((m) => m.kind === "buy");
     const unbox = res.methods.filter((m) => m.kind === "unbox");
     const notes = res.notes.map((n) => floatNote(n, res)).join("");
-    if (!ranked.length) {
-      $("#t-result").innerHTML = hero + notes + `<div class="panel empty">Aucune méthode chiffrable avec les prix actuels des sites cochés.</div>`;
+    const exact = tradeitMode() ? exactContracts(ti, st) : null;
+    tgList = exact || [];
+    const perWear = res.methods.filter((m) => m.kind === "tradeup");
+    const bestTu = exact ? (exact[0] ? exact[0].cheap.expected : null) : (perWear[0] ? perWear[0].expected : null);
+    if (!buy && bestTu == null) {
+      $("#t-result").innerHTML = hero + notes + `<div class="panel empty">Aucune méthode chiffrable avec les prix actuels${tradeitMode() ? " de tradeit" : " des sites cochés"}.</div>`;
       return;
     }
-    const best = ranked[0];
-    const cards = ranked.map((m) => {
-      const isBest = m === best;
-      if (m.kind === "buy") {
-        return `<div class="method${isBest ? " best" : ""}"><div>
+
+    let buyCard = "";
+    if (buy) {
+      const others = g ? "" : buy.rows.filter((r) => r.q && r !== buy.best).sort((a, b) => a.q.price - b.q.price).slice(0, 4)
+        .map((r) => `${esc(short(r.hash))} ${money(r.q.price)}`).join(" · ");
+      const isBest = bestTu == null || buy.cost <= bestTu;
+      buyCard = `<div class="method${isBest ? " best" : ""}"><div>
           <h3>Acheter directement${isBest ? " · le moins cher" : ""}</h3>
-          <div class="meta-row"><span>${esc(m.best.hash)}</span><span>${srcBadge(m.best.q, m.best.hash)}</span><span>aucun risque</span></div></div>
-          <div class="big">${money(m.expected)}<small>prix actuel</small></div></div>`;
-      }
-      const thumbs = m.inputs.map((k) => `<div class="thumb">${img(catalog.coverts[k.name].img, k.name)}${k.n}× ${esc(SHORT[k.wear])}</div>`).join("");
-      return `<div class="method${isBest ? " best" : ""}"><div>
+          <div class="meta-row"><span>${esc(buy.best.hash)}</span><span>${srcBadge(buy.best.q, buy.best.hash)}</span><span>aucun risque</span></div>
+          ${others ? `<p class="muted small" style="margin:6px 0 0">Ensuite : ${others}</p>` : ""}</div>
+          <div class="big">${money(buy.cost)}<small>${tradeitMode() ? "prix d'échange" : "prix actuel"}</small></div></div>`;
+    }
+
+    let cards;
+    if (exact) {
+      const row = (r, k, title) => {
+        const its = r.inputs.map((x) => `<div class="ti-it" title="${esc(x.case)}">${img(x.img, x.name)}<b>${esc(x.name)}</b>
+            <small>${esc(SHORT[x.wear])} · ${x.float.toFixed(4)}</small><small>${money(x.price)}</small></div>`).join("");
+        const cls = r.profit >= 0 ? "win" : "loss";
+        return `<div class="tg-row"><h4>${title}</h4><div class="ti-items">${its}</div>
+          <div class="meta-row"><span>contrat <b>${money(r.cost)}</b></span><span>chance ${g ? "de la cible" : "d'en avoir un"} <b>${pct(r.pT)}</b></span>
+            <span>coût moyen pour l'avoir <b>${money(r.expected)}</b></span><span>valeur moyenne <b>${money(r.ev)}</b></span>
+            <span>profit moyen <b class="${cls}">${signed(r.profit)}</b> (${pct(r.roi, true)})</span><span>chance de profit <b>${pct(r.pWin)}</b></span></div>
+          <div class="btns" style="margin-top:6px"><button type="button" class="btn sm ghost" data-tgres="${k}">Résultats (${r.outcomes.length})</button>
+            <button type="button" class="btn sm" data-tgload="${k}">Ouvrir dans le constructeur</button></div>
+          <div class="ti-oc" data-tgbox="${k}" hidden></div></div>`;
+      };
+      cards = exact.map((e, i) => {
+        const isBest = i === 0 && (!buy || e.cheap.expected < buy.cost);
+        return `<div class="method tg${isBest ? " best" : ""}"><div>
+          <h3>Trade-up 100 % ${esc(e.col.case)} · ${pct(e.p)} par Covert${isBest ? " · le moins cher en moyenne" : ""}</h3>
+          ${row(e.cheap, `${i}:cheap`, "Le moins cher pour l'avoir")}
+          ${e.rich ? row(e.rich, `${i}:rich`, "Le plus rentable en moyenne") : ""}</div>
+          <div class="big">${money(e.cheap.expected)}<small>coût moyen pour l'avoir</small></div></div>`;
+      }).join("") || `<div class="panel empty">Aucun Covert de ces caisses en stock chez tradeit, avec un float connu${state.minWear !== "any" && g ? " assez bas" : ""}.</div>`;
+    } else {
+      const best = perWear[0];
+      cards = perWear.map((m) => {
+        const isBest = m === best && (!buy || m.expected < buy.cost);
+        const thumbs = m.inputs.map((k) => `<div class="thumb">${img(catalog.coverts[k.name].img, k.name)}${k.n}× ${esc(SHORT[k.wear])}</div>`).join("");
+        return `<div class="method${isBest ? " best" : ""}"><div>
           <h3>${esc(m.label)}${isBest ? " · le moins cher en moyenne" : ""}</h3>
           <div class="thumbs">${thumbs}</div>
           <div class="meta-row"><span>contrat <b>${money(m.cost)}</b></span><span>chance <b>${pct(m.p)}</b></span>
             <span><b>${num(m.tries)}</b> contrats en moyenne</span><span>valeur moyenne <b>${money(m.ev)}</b></span>
-            <span>cible ${esc(m.targetWear || "")}</span></div>
+            ${g ? `<span>cible ${esc(m.targetWear || "")}</span>` : ""}</div>
           <div class="btns" style="margin-top:8px"><button type="button" class="btn sm" data-load='${esc(JSON.stringify(m.inputs.map((k) => [k.name, k.wear, k.n])))}'>Ouvrir dans le constructeur</button></div>
         </div><div class="big">${money(m.expected)}<small>coût moyen pour l'avoir</small></div></div>`;
-    }).join("");
-    const buy = ranked.find((m) => m.kind === "buy");
-    const tu = ranked.find((m) => m.kind === "tradeup");
+      }).join("");
+    }
+
     let verdict = "";
-    if (best.kind === "buy" && tu) verdict = `L'achat direct est <b>${(tu.expected / best.expected).toLocaleString("fr-FR", { maximumFractionDigits: 1 })}× moins cher</b> que le meilleur trade-up pour avoir cette cible précise.`;
-    else if (best.kind === "tradeup" && buy) verdict = `Le trade-up revient en moyenne <b>${money(buy.expected - best.expected)} moins cher</b> que l'achat direct, avec du risque.`;
-    else if (!buy) verdict = `<span class="loss">Aucune annonce actuelle pour l'acheter directement</span> : impossible de comparer avec l'achat.`;
-    const unboxLine = unbox.length ? `<p class="muted small">Pour comparaison, l'ouvrir dans une caisse coûterait ${money(unbox[0].expected, 0)} en moyenne (${esc(unbox[0].case)}, ${pct(unbox[0].p)} par ouverture, clé ${money(KEY_PRICE)}).</p>` : "";
-    $("#t-result").innerHTML = hero + notes + `<div class="panel"><p style="margin:0 0 10px">${verdict}</p><div class="methods">${cards}</div>
-      <p class="muted small">« Coût moyen pour l'avoir » = ce que tu dépenses en moyenne avant de tenir la cible, ${tradeitMode()
+    if (buy && bestTu != null) {
+      verdict = buy.cost <= bestTu
+        ? `L'achat direct est <b>${(bestTu / buy.cost).toLocaleString("fr-FR", { maximumFractionDigits: 1 })}× moins cher</b> que le meilleur trade-up pour ${g ? "avoir cette cible précise" : "en avoir un"}.`
+        : `Le trade-up revient en moyenne <b>${money(buy.cost - bestTu)} moins cher</b> que l'achat direct, avec du risque.`;
+    } else if (!buy) {
+      verdict = `<span class="loss">Aucune offre actuelle pour l'acheter directement</span> : impossible de comparer avec l'achat.`;
+    }
+    const how = exact
+      ? `Contrats calculés avec les items <b>précis</b> du stock tradeit (float exact, plus bas floats de chaque pile), tout en prix d'échange.
+         « Coût moyen pour l'avoir » = ce que tu dépenses en moyenne avant de tenir ${g ? "la cible" : "l'un d'eux"}, en échangeant au passage les autres résultats chez tradeit.
+         ${exact.some((e) => e.p >= 0.999) ? "Quand la chance est de 100 %, c'est simplement le prix du contrat : tu l'as à coup sûr, mais la finition et l'usure tombent au hasard (voir Résultats)." : ""}`
+      : `« Coût moyen pour l'avoir » = ce que tu dépenses en moyenne avant de tenir ${g ? "la cible" : "l'un d'eux"}, ${tradeitMode()
         ? "en échangeant au passage les autres résultats chez tradeit (prix d'échange, sans frais)"
-        : `en revendant au passage les autres résultats (frais ${esc(state.fee)} %)`}.</p>${unboxLine}</div>`;
+        : `en revendant au passage les autres résultats (frais ${esc(state.fee)} %)`}.`;
+    const unboxLine = unbox.length ? `<p class="muted small">Pour comparaison, l'ouvrir dans une caisse coûterait ${money(unbox[0].expected, 0)} en moyenne (${esc(unbox[0].case)}, ${pct(unbox[0].p)} par ouverture, clé ${money(KEY_PRICE)}).</p>` : "";
+    $("#t-result").innerHTML = hero + notes + `<div class="panel"><p style="margin:0 0 10px">${verdict}</p><div class="methods">${buyCard}${cards}</div>
+      <p class="muted small">${how}</p>${unboxLine}</div>`;
   }
 
   function floatNote(n, res) {
@@ -974,6 +1115,22 @@
         if (r) { state.pay = "tradeit"; loadSlots(r.inputs.map((x) => ({ name: x.name, wear: x.wear, float: x.float, price: null, ti: x.q.trade }))); }
         return;
       }
+      const tr = t.closest("[data-tgres]");
+      if (tr) {
+        const box = $(`[data-tgbox="${tr.dataset.tgres}"]`);
+        const r = tgAt(tr.dataset.tgres);
+        if (!box || !r) return;
+        if (!box.innerHTML) box.innerHTML = `<div class="ocgrid">${ocCards(r.outcomes.slice().sort((a, b) => (b.net || 0) - (a.net || 0)))}</div>`;
+        box.hidden = !box.hidden;
+        tr.textContent = box.hidden ? `Résultats (${r.outcomes.length})` : "Masquer les résultats";
+        return;
+      }
+      const tg = t.closest("[data-tgload]");
+      if (tg) {
+        const r = tgAt(tg.dataset.tgload);
+        if (r) { state.pay = "tradeit"; loadSlots(r.inputs.map((x) => ({ name: x.name, wear: x.wear, float: x.float, price: null, ti: x.q.trade }))); }
+        return;
+      }
       const ta = t.closest("[data-tiadd]");
       if (ta) {
         const msg = $("#ti-msg");
@@ -1055,8 +1212,7 @@
 
     // gold vise
     $("#target").addEventListener("input", (e) => {
-      const v = e.target.value.trim();
-      const hit = catalog.golds[v] ? v : Object.keys(catalog.golds).find((n) => n.toLowerCase() === v.toLowerCase());
+      const hit = matchTarget(e.target.value.trim());
       if (hit && hit !== state.target) { state.target = hit; save(); renderTarget(); }
     });
     $("#target").addEventListener("focus", (e) => e.target.select());
@@ -1068,8 +1224,10 @@
   }
 
   function fillStatic() {
-    $("#golds").innerHTML = Object.keys(catalog.golds).sort((a, b) => a.localeCompare(b)).map((n) => `<option value="${esc(n)}">`).join("");
-    $("#examples").innerHTML = EXAMPLES.filter((n) => catalog.golds[n]).map((n) => `<button type="button" data-ex="${esc(n)}">${esc(short(n))}</button>`).join("");
+    // un gold precis, ou toutes les finitions d'un couteau / de gants
+    const types = [...new Set(Object.keys(catalog.golds).map(typeOf))].map((t) => t + ALL).filter((t) => targetInfo(t));
+    $("#golds").innerHTML = Object.keys(catalog.golds).concat(types).sort((a, b) => a.localeCompare(b)).map((n) => `<option value="${esc(n)}">`).join("");
+    $("#examples").innerHTML = EXAMPLES.filter((n) => targetInfo(n)).map((n) => `<button type="button" data-ex="${esc(n)}">${esc(short(n))}</button>`).join("");
     $("#pk-case").innerHTML = `<option value="">Toutes les caisses</option>` +
       catalog.collections.slice().sort((a, b) => a.case.localeCompare(b.case)).map((c) => `<option>${esc(c.case)}</option>`).join("");
     $("#srcs").innerHTML = prices.order.map((k) =>
@@ -1101,7 +1259,7 @@
         .map(([name, wear, float]) => ({ name, wear, float: float ? +float : null, price: null }));
       if (slots.length) { state.slots = slots.slice(0, 5).concat(Array(Math.max(0, 5 - slots.length)).fill(null)); state.tab = "builder"; }
     }
-    if (h.get("t") && catalog.golds[h.get("t")]) { state.target = h.get("t"); state.tab = "target"; }
+    if (h.get("t") && targetInfo(h.get("t"))) { state.target = h.get("t"); state.tab = "target"; }
     fillStatic();
     renderHeader();
     bind();
